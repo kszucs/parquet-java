@@ -24,7 +24,7 @@ import org.apache.parquet.Preconditions;
  * Derives the rolling hash mask that content defined chunking tests boundary candidates against.
  *
  * <p>Ported from Arrow C++ {@code parquet::internal::CalculateMask} and arrow-rs
- * {@code CdcChunker::calculate_mask}; the arithmetic has to stay bit-identical to theirs.
+ * {@code ContentDefinedChunker::calculate_mask}; the arithmetic has to stay bit-identical to theirs.
  */
 public final class RollingHashMask {
 

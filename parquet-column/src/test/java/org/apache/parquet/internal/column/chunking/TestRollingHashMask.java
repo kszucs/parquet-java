@@ -23,12 +23,10 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
-/**
- * Ported from Arrow C++'s {@code TestCDC.RollingHashMaskCalculation} and
- * {@code TestCDC.ChunkSizeParameterValidation} ({@code cpp/src/parquet/chunker_internal_test.cc}),
- * with a few edge cases of its own.
- */
+/** Mostly ported from Arrow C++'s {@code TestCDC.RollingHashMaskCalculation} and {@code ChunkSizeParameterValidation}. */
 public class TestRollingHashMask {
 
   private static final long MIN_SIZE = 256 * 1024L;
@@ -54,59 +52,42 @@ public class TestRollingHashMask {
   }
 
   @Test
-  public void rejectsANegativeMinimum() {
+  public void rejectsNegativeMinimum() {
     assertThatThrownBy(() -> RollingHashMask.calculate(-1, 1024, 0))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("Invalid content defined chunking minimum chunk size (negative): -1");
   }
 
   @Test
-  public void rejectsARangeThatIsNotAscending() {
+  public void rejectsRangeThatIsNotAscending() {
     assertThatThrownBy(() -> RollingHashMask.calculate(1024, 512, 0))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("must be greater than");
+        .hasMessage("Invalid content defined chunking size range: maximum chunk size (512) must be greater "
+            + "than minimum chunk size (1024)");
     assertThatThrownBy(() -> RollingHashMask.calculate(32, 32, 0))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("must be greater than");
+        .hasMessage("Invalid content defined chunking size range: maximum chunk size (32) must be greater "
+            + "than minimum chunk size (32)");
   }
 
-  @Test
-  public void rejectsASizeRangeTooNarrowForTheNormalizationLevel() {
-    // With eight tables the mask needs at least one bit, so the min/max gap must be at least 32 at
-    // normLevel 0, 64 at 1 and 128 at 2.
-    assertThatThrownBy(() -> RollingHashMask.calculate(0, 16, 0))
+  /** The mask needs at least one bit, so the size range must be at least 32, 64 or 128 for level 0, 1 or 2. */
+  @ParameterizedTest
+  @CsvSource({"0, 16, 0", "32, 48, 0", "1, 33, 1", "0, 123, 2", "128, 384, -60"})
+  public void rejectsSizeRangeTooNarrowForTheNormalizationLevel(long min, long max, int normLevel) {
+    assertThatThrownBy(() -> RollingHashMask.calculate(min, max, normLevel))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("between 1 and 63 bits");
-    assertThatCode(() -> RollingHashMask.calculate(0, 32, 0)).doesNotThrowAnyException();
-    assertThatThrownBy(() -> RollingHashMask.calculate(32, 48, 0))
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("between 1 and 63 bits");
-    assertThatCode(() -> RollingHashMask.calculate(32, 64, 0)).doesNotThrowAnyException();
-
-    assertThatThrownBy(() -> RollingHashMask.calculate(1, 33, 1))
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("between 1 and 63 bits");
-    assertThatCode(() -> RollingHashMask.calculate(1, 65, 1)).doesNotThrowAnyException();
-
-    assertThatThrownBy(() -> RollingHashMask.calculate(0, 123, 2))
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("between 1 and 63 bits");
-    assertThatCode(() -> RollingHashMask.calculate(0, 128, 2)).doesNotThrowAnyException();
-
-    assertThatThrownBy(() -> RollingHashMask.calculate(128, 384, -60))
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("between 1 and 63 bits");
+        .hasMessageStartingWith("The content defined chunking mask must be between 1 and 63 bits");
   }
 
-  @Test
-  public void acceptsALargeEnvelope() {
-    assertThatCode(() -> RollingHashMask.calculate(1024 * 1024L * 1024L, 2L * 1024 * 1024 * 1024, 0))
-        .doesNotThrowAnyException();
+  @ParameterizedTest
+  @CsvSource({"0, 32, 0", "32, 64, 0", "1, 65, 1", "0, 128, 2", "1073741824, 2147483648, 0"})
+  public void acceptsSizeRangeWideEnoughForTheNormalizationLevel(long min, long max, int normLevel) {
+    assertThatCode(() -> RollingHashMask.calculate(min, max, normLevel)).doesNotThrowAnyException();
   }
 
   /** A deliberate deviation: Arrow C++ and arrow-rs overflow here. */
   @Test
-  public void handlesAnEnvelopeThatWouldOverflowTheAverage() {
+  public void handlesEnvelopeThatWouldOverflowTheAverage() {
     assertThat(RollingHashMask.calculate(256 * 1024L, Long.MAX_VALUE, 0)).isEqualTo(0xFFFFFFFFFFFFFFC0L);
   }
 }

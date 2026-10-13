@@ -215,12 +215,8 @@ public class TestDictionary {
     }
   }
 
-  /**
-   * Without the first-page judgement, as content defined chunking asks for, a dictionary falls back
-   * only on its size limit, as Arrow C++ decides it, even after a first page of nulls alone.
-   */
   @Test
-  public void fallsBackOnTheSizeLimitAloneWithoutAFirstPageJudgement() throws IOException {
+  public void fallsBackOnSizeLimitAloneWithoutFirstPageJudgement() throws IOException {
     // One page of 100 distinct values is less than its dictionary costs.
     assertThat(pageEncodings(true, 1 << 20, 100)).containsExactly(PLAIN, PLAIN, PLAIN);
     assertThat(pageEncodings(false, 1 << 20, 100))
@@ -231,18 +227,16 @@ public class TestDictionary {
         .containsExactly(PLAIN_DICTIONARY, PLAIN_DICTIONARY, PLAIN_DICTIONARY);
   }
 
-  /** A page of nulls alone is encoded against an empty dictionary with no bits, as in Arrow C++. */
   @Test
-  public void aPageOfNullsAloneTakesNoBits() throws IOException {
+  public void pageOfNullsAloneTakesNoBits() throws IOException {
     try (PlainBinaryDictionaryValuesWriter writer =
         new PlainBinaryDictionaryValuesWriter(1 << 20, PLAIN_DICTIONARY, PLAIN_DICTIONARY, allocator)) {
       assertThat(writer.getBytes().toByteArray()).containsExactly(0);
     }
   }
 
-  /** The writer factory judges the first page unless content defined chunking is enabled. */
   @Test
-  public void theFactoryJudgesTheFirstPageUnlessChunking() {
+  public void factoryJudgesFirstPageUnlessChunking() {
     ColumnDescriptor path =
         new ColumnDescriptor(new String[] {"v"}, Types.required(BINARY).named("v"), 0, 0);
     assertThat(firstPageEncoding(ParquetProperties.builder().build(), path)).isEqualTo(PLAIN);

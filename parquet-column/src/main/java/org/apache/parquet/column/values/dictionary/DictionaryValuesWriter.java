@@ -116,10 +116,7 @@ public abstract class DictionaryValuesWriter extends ValuesWriter implements Req
     return ret;
   }
 
-  /**
-   * A dictionary page without entries where pages were dictionary encoded with nulls alone, as Arrow
-   * C++ writes one, since such a page still needs a dictionary to be read.
-   */
+  /** An empty dictionary page for pages of nulls alone, which still need one to be read, as in Arrow C++. */
   protected DictionaryPage emptyDictPage() {
     return encodedAPage ? new DictionaryPage(BytesInput.empty(), 0, encodingForDictionaryPage) : null;
   }

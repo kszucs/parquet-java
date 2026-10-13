@@ -18,9 +18,6 @@
  */
 package org.apache.parquet.column.impl;
 
-import java.io.IOException;
-import java.io.OutputStream;
-import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import org.apache.parquet.column.CdcOptions;
 import org.apache.parquet.column.ColumnDescriptor;
@@ -28,19 +25,13 @@ import org.apache.parquet.internal.column.chunking.RollingHashMask;
 import org.apache.parquet.io.api.Binary;
 
 /**
- * Decides content defined data page boundaries for one column.
+ * Decides the content defined data page boundaries of one leaf column for a whole file: each
+ * {@code offer} of a triplet says whether a page should end before it.
  *
- * <p>The column writer offers every {@code (definitionLevel, repetitionLevel, value)} triplet, and
- * each {@code offer} says whether a page should end <i>before</i> it.
- *
- * <p>Ported from Arrow C++ {@code parquet/chunker_internal} and arrow-rs
- * {@code column/chunker/cdc.rs}. Pages only deduplicate across implementations while all of them
- * place the same boundaries, which {@code TestCdcChunkerGoldenBoundaries} pins against Arrow C++.
- *
- * <p>Not thread safe. One instance serves one leaf column for a whole file: it is never reset, at a
- * page or a row group boundary, but carried to the next row group's store.
+ * <p>Ported from Arrow C++ {@code parquet/chunker_internal} and arrow-rs {@code column/chunker/cdc.rs},
+ * whose boundaries it must reproduce. Not thread safe.
  */
-final class CdcChunker {
+final class ContentDefinedChunker {
 
   private final long minChunkSize;
   private final long maxChunkSize;
@@ -53,7 +44,7 @@ final class CdcChunker {
   private int nthRun;
   private long chunkSize;
 
-  CdcChunker(CdcOptions options, ColumnDescriptor path) {
+  ContentDefinedChunker(CdcOptions options, ColumnDescriptor path) {
     this.minChunkSize = options.getMinChunkSize();
     this.maxChunkSize = options.getMaxChunkSize();
     this.mask = RollingHashMask.calculate(minChunkSize, maxChunkSize, options.getNormLevel());
@@ -125,58 +116,19 @@ final class CdcChunker {
     return repetitionLevel == 0 && needNewChunk();
   }
 
-  // The one kind of binary whose bytes may lie in a direct buffer, which Binary.writeTo would copy.
-  private static final Class<? extends Binary> BUFFER_BACKED =
-      Binary.fromConstantByteBuffer(ByteBuffer.allocate(0)).getClass();
-
-  /** The value's bytes without a length prefix, as the references hash them, read where they lie. */
+  /** The value's bytes without a length prefix, as the references hash them. */
   private void rollBinary(Binary value) {
     chunkSize += value.length();
     if (chunkSize < minChunkSize) {
       return;
     }
-    if (value.getClass() != BUFFER_BACKED) {
-      try {
-        value.writeTo(binaryRoller);
-      } catch (IOException e) {
-        throw new UncheckedIOException(e);
-      }
-      return;
-    }
+    // A view of the value's bytes, wherever they lie, not a copy.
     ByteBuffer bytes = value.toByteBuffer();
-    if (bytes.hasArray()) {
-      rollBytes(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining());
-      return;
-    }
     long hash = rollingHash;
     boolean matched = hasMatched;
     long[] table = GearHashTable.TABLE[nthRun];
     for (int i = bytes.position(); i < bytes.limit(); ++i) {
       hash = (hash << 1) + table[bytes.get(i) & 0xFF];
-      matched |= (hash & mask) == 0;
-    }
-    rollingHash = hash;
-    hasMatched = matched;
-  }
-
-  private final OutputStream binaryRoller = new OutputStream() {
-    @Override
-    public void write(int b) {
-      rollBytes(new byte[] {(byte) b}, 0, 1);
-    }
-
-    @Override
-    public void write(byte[] bytes, int offset, int length) {
-      rollBytes(bytes, offset, length);
-    }
-  };
-
-  private void rollBytes(byte[] bytes, int offset, int length) {
-    long hash = rollingHash;
-    boolean matched = hasMatched;
-    long[] table = GearHashTable.TABLE[nthRun];
-    for (int i = offset; i < offset + length; ++i) {
-      hash = (hash << 1) + table[bytes[i] & 0xFF];
       matched |= (hash & mask) == 0;
     }
     rollingHash = hash;
