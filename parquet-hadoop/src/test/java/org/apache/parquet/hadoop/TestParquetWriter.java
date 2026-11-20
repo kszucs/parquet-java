@@ -45,6 +45,10 @@ import static org.assertj.core.data.Offset.offset;
 import com.google.common.collect.ImmutableMap;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -61,11 +65,14 @@ import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.bytes.HeapByteBufferAllocator;
 import org.apache.parquet.bytes.TrackingByteBufferAllocator;
 import org.apache.parquet.column.ColumnDescriptor;
+import org.apache.parquet.column.Dictionary;
 import org.apache.parquet.column.Encoding;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.ParquetProperties.WriterVersion;
 import org.apache.parquet.column.page.DataPage;
 import org.apache.parquet.column.page.DataPageV2;
+import org.apache.parquet.column.page.DictionaryPage;
+import org.apache.parquet.column.page.DictionaryPageReadStore;
 import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.column.page.PageReader;
 import org.apache.parquet.column.values.bloomfilter.BloomFilter;
@@ -92,6 +99,8 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.parquet.hadoop.util.HadoopOutputFile;
+import org.apache.parquet.io.DelegatingPositionOutputStream;
+import org.apache.parquet.io.LocalOutputFile;
 import org.apache.parquet.io.OutputFile;
 import org.apache.parquet.io.PositionOutputStream;
 import org.apache.parquet.io.api.Binary;
@@ -103,6 +112,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 public class TestParquetWriter {
 
@@ -237,6 +248,53 @@ public class TestParquetWriter {
   @TempDir
   private java.nio.file.Path tempDir;
 
+  @ParameterizedTest
+  @CsvSource({"0,false", "1,false", "5,false", "0,true", "1,true", "5,true"})
+  public void testDataSizeAfterClose(int records, boolean channelBacked) throws IOException {
+    java.nio.file.Path file = tempDir.resolve("size.parquet");
+    MessageType schema = parseMessageType("message test { required int32 value; }");
+    OutputFile output = channelBacked ? channelOutputFile(file) : new LocalOutputFile(file);
+    ParquetWriter<Group> writer = ExampleParquetWriter.builder(output)
+        .withType(schema)
+        .withAllocator(allocator)
+        .withRowGroupRowCountLimit(2)
+        .build();
+    try (writer) {
+      assertThat(writer.getDataSize()).isZero();
+      SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+      for (int i = 0; i < records; i++) {
+        writer.write(factory.newGroup().append("value", i));
+      }
+    }
+
+    assertThat(writer.getDataSize()).isEqualTo(Files.size(file));
+    writer.close();
+    assertThat(writer.getDataSize()).isEqualTo(Files.size(file));
+
+    try (ParquetReader<Group> reader = ParquetReader.builder(new GroupReadSupport(), new Path(file.toUri()))
+        .build()) {
+      for (int i = 0; i < records; i++) {
+        assertThat(reader.read().getInteger("value", 0)).isEqualTo(i);
+      }
+      assertThat(reader.read()).isNull();
+    }
+  }
+
+  private static OutputFile channelOutputFile(java.nio.file.Path path) {
+    return new LocalOutputFile(path) {
+      @Override
+      public PositionOutputStream create(long blockSizeHint) throws IOException {
+        FileChannel channel = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        return new DelegatingPositionOutputStream(Channels.newOutputStream(channel)) {
+          @Override
+          public long getPos() throws IOException {
+            return channel.position();
+          }
+        };
+      }
+    };
+  }
+
   @Test
   public void testBadWriteSchema() throws IOException {
     Path path = tempPath("test.parquet");
@@ -332,6 +390,143 @@ public class TestParquetWriter {
                 .hashBytes(Binary.fromString(name).toByteBuffer())))
             .isTrue();
       }
+    }
+  }
+
+  @Test
+  public void testBloomFiltersKeepCollidingDotStringPathsDistinct() throws IOException {
+    Map<ColumnPath, BloomFilter> bloomFilters = writeBloomFiltersForCollidingPaths();
+    BloomFilter topLevelBloom = bloomFilters.get(ColumnPath.get("a.b"));
+    BloomFilter nestedBloom = bloomFilters.get(ColumnPath.get("a", "b"));
+    assertThat(topLevelBloom).isNotNull();
+    assertThat(nestedBloom).isNotNull();
+
+    for (int valueId = 0; valueId < 10; valueId++) {
+      long topLevelHash = LongHashFunction.xx(0)
+          .hashBytes(Binary.fromString("top-" + valueId).toByteBuffer());
+      long nestedHash = LongHashFunction.xx(0)
+          .hashBytes(Binary.fromString("nested-" + valueId).toByteBuffer());
+      assertThat(topLevelBloom.findHash(topLevelHash)).isTrue();
+      assertThat(nestedBloom.findHash(nestedHash)).isTrue();
+    }
+  }
+
+  private Map<ColumnPath, BloomFilter> writeBloomFiltersForCollidingPaths() throws IOException {
+    // Parquet identifies columns by path components. These two paths are different:
+    //
+    //   top-level field named "a.b" -> ["a.b"]
+    //   nested field "b" in "a"     -> ["a", "b"]
+    //
+    // Flattening either path with '.' produces the same string, "a.b". When Bloom filters are
+    // stored in a map keyed by that flattened string, the second column overwrites the first
+    // column's filter and both footer entries can be associated with the same filter.
+    MessageType schema = Types.buildMessage()
+        .required(BINARY)
+        .as(stringType())
+        .named("a.b")
+        .requiredGroup()
+        .required(BINARY)
+        .as(stringType())
+        .named("b")
+        .named("a")
+        .named("msg");
+    Configuration conf = new Configuration();
+    GroupWriteSupport.setSchema(schema, conf);
+    GroupFactory factory = new SimpleGroupFactory(schema);
+
+    Path path = newTempPath();
+    // Disable dictionary encoding so the writer emits a Bloom filter for each column. Use
+    // disjoint value prefixes so the test can detect when one column receives the other's filter.
+    try (ParquetWriter<Group> writer = ExampleParquetWriter.builder(path)
+        .withAllocator(allocator)
+        .withConf(conf)
+        .withDictionaryEncoding(false)
+        .withBloomFilterEnabled(true)
+        .build()) {
+      for (int i = 0; i < 100; i++) {
+        int valueId = i % 10;
+        Group group = factory.newGroup().append("a.b", "top-" + valueId);
+        group.addGroup("a").append("b", "nested-" + valueId);
+        writer.write(group);
+      }
+    }
+
+    try (ParquetFileReader reader = ParquetFileReader.open(HadoopInputFile.fromPath(path, conf))) {
+      BlockMetaData block = reader.getFooter().getBlocks().get(0);
+      // Locate columns by their component-based ColumnPath. Using toDotString() here would repeat
+      // the bug and make both columns indistinguishable to the test.
+      ColumnChunkMetaData topLevelColumn = block.getColumns().stream()
+          .filter(column -> column.getPath().equals(ColumnPath.get("a.b")))
+          .findFirst()
+          .orElseThrow();
+      ColumnChunkMetaData nestedColumn = block.getColumns().stream()
+          .filter(column -> column.getPath().equals(ColumnPath.get("a", "b")))
+          .findFirst()
+          .orElseThrow();
+      // Different offsets prove that the footer references two separately serialized filters rather
+      // than pointing both columns at whichever filter was inserted last.
+      assertThat(topLevelColumn.getBloomFilterOffset()).isNotEqualTo(nestedColumn.getBloomFilterOffset());
+      BloomFilter topLevelBloom = reader.readBloomFilter(topLevelColumn);
+      BloomFilter nestedBloom = reader.readBloomFilter(nestedColumn);
+      Map<ColumnPath, BloomFilter> bloomFilters = new HashMap<>();
+      bloomFilters.put(ColumnPath.get("a.b"), topLevelBloom);
+      bloomFilters.put(ColumnPath.get("a", "b"), nestedBloom);
+      return bloomFilters;
+    }
+  }
+
+  @Test
+  public void testDictionaryReaderKeepsCollidingDotStringPathsDistinct() throws Exception {
+    MessageType schema = Types.buildMessage()
+        .required(BINARY)
+        .as(stringType())
+        .named("a.b")
+        .requiredGroup()
+        .required(BINARY)
+        .as(stringType())
+        .named("b")
+        .named("a")
+        .named("msg");
+    Configuration conf = new Configuration();
+    GroupWriteSupport.setSchema(schema, conf);
+    GroupFactory factory = new SimpleGroupFactory(schema);
+
+    Path path = newTempPath();
+    try (ParquetWriter<Group> writer = ExampleParquetWriter.builder(path)
+        .withAllocator(allocator)
+        .withConf(conf)
+        .withDictionaryEncoding(true)
+        .build()) {
+      for (int i = 0; i < 100; i++) {
+        String suffix = (i % 2 == 0) ? "one" : "two";
+        Group group = factory.newGroup().append("a.b", suffix);
+        group.addGroup("a").append("b", "nested-" + suffix);
+        writer.write(group);
+      }
+    }
+
+    try (ParquetFileReader reader = ParquetFileReader.open(HadoopInputFile.fromPath(path, conf))) {
+      ColumnDescriptor topLevelDescriptor = schema.getColumnDescription(new String[] {"a.b"});
+      ColumnDescriptor nestedDescriptor = schema.getColumnDescription(new String[] {"a", "b"});
+      DictionaryPageReadStore dictionaryReader = reader.getNextDictionaryReader();
+      DictionaryPage topLevelPage = dictionaryReader.readDictionaryPage(topLevelDescriptor);
+      DictionaryPage nestedPage = dictionaryReader.readDictionaryPage(nestedDescriptor);
+      assertThat(topLevelPage).isNotNull();
+      assertThat(nestedPage).isNotNull();
+
+      Dictionary topLevelDictionary = topLevelPage.getEncoding().initDictionary(topLevelDescriptor, topLevelPage);
+      Set<String> topLevelValues = new HashSet<>();
+      for (int id = 0; id <= topLevelDictionary.getMaxId(); id++) {
+        topLevelValues.add(topLevelDictionary.decodeToBinary(id).toStringUsingUTF8());
+      }
+      assertThat(topLevelValues).containsExactlyInAnyOrder("one", "two");
+
+      Dictionary nestedDictionary = nestedPage.getEncoding().initDictionary(nestedDescriptor, nestedPage);
+      Set<String> nestedValues = new HashSet<>();
+      for (int id = 0; id <= nestedDictionary.getMaxId(); id++) {
+        nestedValues.add(nestedDictionary.decodeToBinary(id).toStringUsingUTF8());
+      }
+      assertThat(nestedValues).containsExactlyInAnyOrder("nested-one", "nested-two");
     }
   }
 

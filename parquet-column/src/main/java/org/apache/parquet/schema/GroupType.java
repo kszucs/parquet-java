@@ -22,6 +22,7 @@ import static java.util.Arrays.asList;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -116,11 +117,28 @@ public class GroupType extends Type {
   GroupType(
       Repetition repetition, String name, LogicalTypeAnnotation logicalTypeAnnotation, List<Type> fields, ID id) {
     super(name, repetition, logicalTypeAnnotation, id);
-    this.fields = fields;
-    this.indexByName = new HashMap<>();
-    for (int i = 0; i < fields.size(); i++) {
-      indexByName.put(fields.get(i).getName(), i);
+    if (logicalTypeAnnotation instanceof LogicalTypeAnnotation.FileLogicalTypeAnnotation) {
+      // Keep the validated schema immutable so readers and writers need not revalidate every value.
+      this.fields = Collections.unmodifiableList(new ArrayList<>(fields));
+      ((LogicalTypeAnnotation.FileLogicalTypeAnnotation) logicalTypeAnnotation).validateFields(name, this.fields);
+    } else {
+      this.fields = fields;
     }
+    this.indexByName = new HashMap<>();
+    for (int i = 0; i < this.fields.size(); i++) {
+      indexByName.put(this.fields.get(i).getName(), i);
+    }
+  }
+
+  GroupType(GroupType toCopy, String newName) {
+    super(toCopy, newName);
+    this.fields = toCopy.fields;
+    this.indexByName = toCopy.indexByName;
+  }
+
+  @Override
+  public GroupType withName(String newName) {
+    return new GroupType(this, newName);
   }
 
   /**
@@ -135,6 +153,7 @@ public class GroupType extends Type {
   /**
    * @param newFields a list of types to use as fields in a copy of this group
    * @return a group with the same attributes and new fields.
+   * @throws IllegalArgumentException if the new fields do not conform to this group's FILE annotation
    */
   public GroupType withNewFields(List<Type> newFields) {
     return new GroupType(getRepetition(), getName(), getLogicalTypeAnnotation(), newFields, getId());
@@ -385,18 +404,8 @@ public class GroupType extends Type {
         toMerge.getRepetition(),
         getName(),
         toMerge.getLogicalTypeAnnotation(),
-        mergeFields(toMerge.asGroupType()),
+        mergeFields(toMerge.asGroupType(), strict),
         getId());
-  }
-
-  /**
-   * produces the list of fields resulting from merging toMerge into the fields of this
-   *
-   * @param toMerge the group containing the fields to merge
-   * @return the merged list
-   */
-  List<Type> mergeFields(GroupType toMerge) {
-    return mergeFields(toMerge, true);
   }
 
   /**

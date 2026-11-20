@@ -61,8 +61,6 @@ Environment variables:
   DRY_RUN               Set to 0 for real execution (default: 1)
   NEXUS_USERNAME        Apache Nexus username
   NEXUS_PASSWORD        Apache Nexus password
-  SVN_USERNAME          SVN username for dist.apache.org
-  SVN_PASSWORD          SVN password
   GITHUB_TOKEN          GitHub token for release creation
 
 Example:
@@ -128,6 +126,12 @@ if [[ ${DRY_RUN:-1} -eq 1 ]]; then
   step_summary ""
 fi
 
+if [[ ${DRY_RUN:-1} -ne 1 ]]; then
+  if ! require_env NEXUS_USERNAME NEXUS_PASSWORD; then
+    exit 1
+  fi
+fi
+
 if ! validate_and_extract_version "${version}"; then
   print_error "Invalid version format: '${version}'"
   exit 1
@@ -170,6 +174,18 @@ if ! git rev-parse "${rc_tag}" >/dev/null 2>&1; then
   exit 1
 fi
 
+# The workflow is dispatched from master, which is where these scripts live,
+# so switch to the release branch before comparing it with the RC tag. This
+# runs in dry-run mode too: it is local, and the checks below depend on it.
+release_branch="${BRANCH_PREFIX}${major}.${minor}.x"
+if [[ "$(git branch --show-current)" != "${release_branch}" ]]; then
+  print_info "Switching to ${release_branch}..."
+  if ! git checkout "${release_branch}"; then
+    print_error "Could not check out release branch ${release_branch}"
+    exit 1
+  fi
+fi
+
 rc_commit=$(git rev-list -1 "${rc_tag}")
 current_commit=$(git rev-parse HEAD)
 
@@ -206,58 +222,17 @@ fi
 step_summary "Staging repository \`${staging_repo_id}\` verified"
 
 # ---------------------------------------------------------------------------
-# Step 1: Move SVN artifacts from dist/dev to dist/release
-# ---------------------------------------------------------------------------
-step_summary ""
-step_summary "### SVN Promotion"
-
-svn_promote_rc_to_release "${version}" "${rc_num}"
-
-step_summary "Promoted \`${rc_tag}\` -> \`${final_tag}\` on dist.apache.org"
-
-# ---------------------------------------------------------------------------
-# Step 2: Clean up superseded patch releases on the same minor branch
-# ---------------------------------------------------------------------------
-# Policy: only patch releases of the *same* minor (parquet-${major}.${minor}.x)
-# that are older than ${version} are removed from dist/release/parquet/.
-# Releases on other minor branches are left in place and must be retired
-# manually. See svn_list_old_releases for the full rationale.
-step_summary ""
-step_summary "### Patch Release Cleanup (parquet-${major}.${minor}.x)"
-
-if [[ ${DRY_RUN:-1} -ne 1 ]]; then
-  if ! old_versions=$(svn_list_old_releases "${version}"); then
-    exit 1
-  fi
-
-  if [[ -n "${old_versions}" ]]; then
-    step_summary "Removing superseded patches on parquet-${major}.${minor}.x:"
-    while IFS= read -r old_dir; do
-      [[ -z "${old_dir}" ]] && continue
-      svn_remove_release "${old_dir}" "${version}"
-      step_summary "- Removed \`${old_dir}\`"
-    done <<< "${old_versions}"
-  else
-    step_summary "No superseded ${major}.${minor}.x patches to clean up"
-  fi
-else
-  print_command "Dry-run, WOULD remove superseded ${major}.${minor}.x patches from dist/release"
-  step_summary "Would remove superseded ${major}.${minor}.x patches (dry-run)"
-fi
-
-# ---------------------------------------------------------------------------
-# Step 3: Create final release tag
+# Step 1: Create final release tag locally (pushed in step 3)
 # ---------------------------------------------------------------------------
 step_summary ""
 step_summary "### Release Tag"
 
 exec_process git tag -a "${final_tag}" "${rc_commit}" -m "Release Apache Parquet ${version}"
-exec_process git push origin "${final_tag}"
 
-step_summary "Created tag \`${final_tag}\` at \`${rc_commit}\`"
+step_summary "Created tag \`${final_tag}\` at \`${rc_commit}\` (pushed in step 3)"
 
 # ---------------------------------------------------------------------------
-# Step 4: Release Nexus staging repo
+# Step 2: Release Nexus staging repo
 # ---------------------------------------------------------------------------
 step_summary ""
 step_summary "### Nexus Release"
@@ -267,8 +242,17 @@ nexus_release_staging_repo "${staging_repo_id}" "Apache Parquet ${version}"
 step_summary "Released staging repository \`${staging_repo_id}\` to Maven Central"
 
 # ---------------------------------------------------------------------------
-# Step 5: Create GitHub Release
+# Step 3: Push the release tag and create the GitHub Release
 # ---------------------------------------------------------------------------
+step_summary ""
+step_summary "### Tag Push"
+
+# Pushed here rather than with the tag creation in step 1: a Nexus failure in
+# step 2 would otherwise leave a published release tag, and the
+# "Final release tag already exists" guard then blocks the retry.
+exec_process git push origin "${final_tag}"
+step_summary "Pushed tag \`${final_tag}\`"
+
 step_summary ""
 step_summary "### GitHub Release"
 
@@ -291,7 +275,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Bump to next development version
+# Step 4: Bump to next development version
 # ---------------------------------------------------------------------------
 step_summary ""
 step_summary "### Version Bump"
@@ -300,13 +284,15 @@ next_snapshot="${next_dev_version}-SNAPSHOT"
 print_info "Bumping version to ${next_snapshot}..."
 
 set_pom_version "${next_snapshot}"
+set_pom_scm_tag "HEAD"
 
 # Update previous.version property
 exec_process ./mvnw -pl . versions:set-property \
   -Dproperty=previous.version -DnewVersion="${version}" \
   --batch-mode -q
 
-exec_process git add -A
+# Stage tracked files only: the version bump only edits existing POMs.
+exec_process git add -u
 exec_process git commit -m "Prepare for next development iteration (${next_snapshot})"
 
 # Refuse to push the version bump to anything that doesn't look like a
@@ -318,7 +304,7 @@ expected_branch="${BRANCH_PREFIX}${major}.${minor}.x"
 if [[ "${current_branch}" != "${expected_branch}" ]]; then
   print_error "Refusing to push version bump: current branch is '${current_branch}'"
   print_error "Expected to be on release branch '${expected_branch}' for version ${version}."
-  print_error "Run the publish workflow with that branch selected, or check out '${expected_branch}' locally."
+  print_error "The script checks out '${expected_branch}' before publishing; something switched branches since then."
   exit 1
 fi
 # Also confirm the format independently in case someone has named a
@@ -332,7 +318,7 @@ exec_process git push origin HEAD
 step_summary "Bumped version to \`${next_snapshot}\` on branch \`${current_branch}\`, set \`previous.version=${version}\`"
 
 # ---------------------------------------------------------------------------
-# Step 7: Generate announce email
+# Step 5: Generate announce email
 # ---------------------------------------------------------------------------
 step_summary ""
 step_summary "### Announce Email"
@@ -356,7 +342,49 @@ step_summary "Thanks to everyone for contributing!"
 step_summary '```'
 
 # ---------------------------------------------------------------------------
-# Step 8: Reminder -- update parquet.apache.org
+# Step 6: Reminder -- promote artifacts on dist.apache.org
+# ---------------------------------------------------------------------------
+# The CI SVN credentials can only write to dist/dev; a PMC member has to
+# move the artifacts into dist/release, so print the exact commands.
+dist_dev_url="${APACHE_DIST_URL}${APACHE_DIST_DEV_PATH}"
+dist_release_url="${APACHE_DIST_URL}${APACHE_DIST_RELEASE_PATH}"
+
+old_versions_listed=1
+if ! old_versions=$(svn_list_old_releases "${version}"); then
+  old_versions_listed=0
+  old_versions=""
+  print_warning "Could not list ${dist_release_url}; the summary will ask for the old releases to be found by hand"
+fi
+
+step_summary ""
+step_summary "### Manual Follow-up (PMC): Promote Artifacts on dist.apache.org"
+step_summary ""
+step_summary "The release artifacts remain in dist dev. A PMC member must run:"
+step_summary ""
+step_summary '```bash'
+step_summary "svn mv ${dist_dev_url}/${rc_tag} \\"
+step_summary "  ${dist_release_url}/${final_tag} \\"
+step_summary "  -m \"Release Apache Parquet ${version}\""
+while IFS= read -r old_dir; do
+  [[ -z "${old_dir}" ]] && continue
+  step_summary "svn rm ${dist_release_url}/${old_dir} \\"
+  step_summary "  -m \"Remove old release ${old_dir} (superseded by ${version})\""
+done <<< "${old_versions}"
+step_summary '```'
+step_summary ""
+if [[ ${old_versions_listed} -eq 0 ]]; then
+  step_summary "> **Could not list \`${dist_release_url}\`.** Also \`svn rm\` any older"
+  step_summary "> \`${TAG_PREFIX}${major}.${minor}.*\` patch releases superseded by \`${version}\`."
+elif [[ -z "${old_versions}" ]]; then
+  step_summary "No superseded ${major}.${minor}.x patch releases to remove."
+else
+  step_summary "The \`svn rm\` lines remove superseded ${major}.${minor}.x patch releases."
+fi
+step_summary ""
+step_summary "Releases on other minor branches are left in place."
+
+# ---------------------------------------------------------------------------
+# Step 7: Reminder -- update parquet.apache.org
 # ---------------------------------------------------------------------------
 release_date=$(date +%Y-%m-%d)
 step_summary ""
@@ -396,13 +424,13 @@ step_summary "### Summary"
 step_summary ""
 step_summary "| Step | Status |"
 step_summary "| --- | --- |"
-step_summary "| SVN promotion | done |"
-step_summary "| Old release cleanup | done |"
 step_summary "| Final release tag | \`${final_tag}\` |"
 step_summary "| Nexus release | \`${staging_repo_id}\` released |"
 step_summary "| GitHub release | created |"
 step_summary "| Version bump | \`${next_snapshot}\` |"
 step_summary "| Announce email | generated |"
+step_summary "| dist.apache.org promotion | **manual (PMC)** -- see commands above |"
+step_summary "| Old release cleanup | **manual (PMC)** -- see commands above |"
 step_summary "| Site update | **manual** -- see template above |"
 
 print_success "Release ${version} published successfully!"

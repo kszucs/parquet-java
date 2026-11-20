@@ -126,6 +126,12 @@ if [[ ${DRY_RUN:-1} -eq 1 ]]; then
   step_summary ""
 fi
 
+if [[ ${DRY_RUN:-1} -ne 1 ]]; then
+  if ! require_env NEXUS_USERNAME NEXUS_PASSWORD SVN_USERNAME SVN_PASSWORD; then
+    exit 1
+  fi
+fi
+
 if ! validate_and_extract_version "${version}"; then
   print_error "Invalid version format: '${version}'. Expected: X.Y.Z"
   exit 1
@@ -215,25 +221,55 @@ step_summary "> it is a mechanical version bump on top of the verified"
 step_summary "> commit above."
 
 # ---------------------------------------------------------------------------
-# Step 4: Set POM versions (only on rc0 or if version doesn't match)
+# Step 4: Set POM version and SCM tag (whenever either doesn't match)
 # ---------------------------------------------------------------------------
 step_summary ""
 step_summary "### Version Update"
 
 current_pom_version=$(get_current_pom_version || echo "unknown")
+current_scm_tag=$(get_current_pom_scm_tag || echo "unknown")
 print_info "Current POM version: ${current_pom_version}"
+print_info "Current POM SCM tag: ${current_scm_tag}"
 
-if [[ "${current_pom_version}" == "${version}" ]]; then
-  print_info "POM version already set to ${version}, skipping version update"
-  step_summary "POM version already at \`${version}\`, no update needed"
+if [[ "${current_pom_version}" == "${version}" && "${current_scm_tag}" == "${rc_tag}" ]]; then
+  print_info "POM version and SCM tag already set for ${rc_tag}, skipping update"
+  step_summary "POM version already at \`${version}\` and SCM tag at \`${rc_tag}\`, no update needed"
 else
-  print_info "Setting POM version to ${version}..."
-  set_pom_version "${version}"
-  step_summary "Updated POM version: \`${current_pom_version}\` -> \`${version}\`"
+  if [[ "${current_pom_version}" != "${version}" ]]; then
+    print_info "Setting POM version to ${version}..."
+    set_pom_version "${version}"
+    step_summary "Updated POM version: \`${current_pom_version}\` -> \`${version}\`"
+  fi
 
-  # Commit version changes
-  exec_process git add -A
-  exec_process git commit -m "Set version to ${version} for release"
+  # Each RC needs its own tag here, so this also runs on rc1+ when the
+  # version is already set. Whatever the branch carried is overwritten.
+  if [[ "${current_scm_tag}" != "${rc_tag}" ]]; then
+    print_info "Setting POM SCM tag to ${rc_tag}..."
+    set_pom_scm_tag "${rc_tag}"
+    step_summary "Updated POM SCM tag: \`${current_scm_tag}\` -> \`${rc_tag}\`"
+  fi
+
+  # Commit version changes. Stage tracked files only: the version and SCM tag
+  # updates only edit existing POMs, and anything untracked must not land in
+  # the release.
+  exec_process git add -u
+  exec_process git commit -m "Set version to ${version} for release (${rc_tag})"
+fi
+
+if ! require_clean_worktree; then
+  step_summary "Working tree check: **FAILED** (see the job log for the offending paths)"
+  exit 1
+fi
+
+# The staged POMs are what Maven Central publishes, so refuse to tag and
+# deploy a commit whose <scm><tag> doesn't name this RC.
+if [[ ${DRY_RUN:-1} -ne 1 ]]; then
+  committed_scm_tag=$(get_current_pom_scm_tag || echo "unknown")
+  if [[ "${committed_scm_tag}" != "${rc_tag}" ]]; then
+    print_error "POM SCM tag is '${committed_scm_tag}', expected '${rc_tag}'"
+    step_summary "SCM tag check: **FAILED** (\`${committed_scm_tag}\` != \`${rc_tag}\`)"
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -257,27 +293,35 @@ step_summary "### Nexus Deployment"
 settings_file=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/parquet-release-settings.XXXXXX")
 generate_maven_settings "${settings_file}"
 
-maven_deploy "${settings_file}"
+staging_description="Apache Parquet ${version} RC${rc_number}"
 
-step_summary "Deployed artifacts to Apache Nexus staging"
-
-# Find and close the staging repo. Verify it actually contains the
-# artifacts we just deployed before closing -- another concurrent run
-# could have created the only open repo we see, and closing the wrong
-# one would corrupt that release.
-nexus_find_open_staging_repo "${NEXUS_PROFILE_NAME}"
-
-if [[ ${DRY_RUN:-1} -ne 1 ]]; then
-  if ! nexus_check_staging_artifact "${staging_repo_id}" "${version}"; then
-    print_error "Open staging repo ${staging_repo_id} does not contain ${version} artifacts."
-    print_error "Refusing to close it -- another release may be in flight. Investigate Nexus before retrying."
-    exit 1
+if ! maven_deploy "${settings_file}" "${staging_description}"; then
+  if maven_find_created_staging_repos; then
+    print_error "Deploy failed after creating staging repository ${created_staging_repo_ids[*]}; check whether it is still in Nexus and drop it before retrying."
+    step_summary "Deploy **FAILED** after creating staging repository \`${created_staging_repo_ids[*]}\`; check Nexus for leftovers"
+  else
+    step_summary "Deploy **FAILED** before a staging repository was created"
   fi
+  exit 1
 fi
 
-nexus_close_staging_repo "${staging_repo_id}" "Apache Parquet ${version} RC${rc_number}"
+if ! maven_read_staging_repo_id; then
+  if maven_find_created_staging_repos; then
+    print_error "Deploy succeeded but the staging repository ID could not be read; the deploy log reports creating ${created_staging_repo_ids[*]}."
+    step_summary "Deploy succeeded but the staging repository ID could not be read; deploy log reports \`${created_staging_repo_ids[*]}\`"
+  else
+    print_error "Deploy succeeded but no staging repository was found; nexus-staging-maven-plugin may not have run, so check Nexus for an implicitly created repository."
+    step_summary "Deploy succeeded but no staging repository was found; check Nexus for an implicitly created repository"
+  fi
+  exit 1
+fi
 
-step_summary "Closed staging repository: \`${staging_repo_id}\`"
+if ! nexus_verify_staging_repo "${staging_repo_id}" "${version}" "${rc_number}"; then
+  step_summary "Verification **FAILED** for staging repository \`${staging_repo_id}\`"
+  exit 1
+fi
+
+step_summary "Deployed, closed and verified staging repository: \`${staging_repo_id}\`"
 
 maven_cleanup_settings "${settings_file}"
 

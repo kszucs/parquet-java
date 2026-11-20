@@ -28,6 +28,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.parquet.bytes.ByteBufferAllocator;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.ParquetProperties.WriterVersion;
+import org.apache.parquet.column.values.alp.AlpConfig;
 import org.apache.parquet.compression.CompressionCodecFactory;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
@@ -455,6 +456,8 @@ public class ParquetWriter<T> implements Closeable {
   }
 
   /**
+   * After a successful close, this is the final file size including the footer.
+   *
    * @return the total size of data written to the file and buffered in memory
    */
   public long getDataSize() {
@@ -682,6 +685,50 @@ public class ParquetWriter<T> implements Closeable {
     }
 
     /**
+     * EXPERIMENTAL: See {@link ParquetProperties.Builder#withContentDefinedChunking(boolean)}.
+     *
+     * @param enabled whether to enable content defined chunking
+     * @return this builder for method chaining
+     */
+    public SELF withContentDefinedChunking(boolean enabled) {
+      encodingPropsBuilder.withContentDefinedChunking(enabled);
+      return self();
+    }
+
+    /**
+     * EXPERIMENTAL: See {@link ParquetProperties.Builder#withContentDefinedChunkingMinSize(long)}.
+     *
+     * @param minSize the minimum chunk size in bytes
+     * @return this builder for method chaining
+     */
+    public SELF withContentDefinedChunkingMinSize(long minSize) {
+      encodingPropsBuilder.withContentDefinedChunkingMinSize(minSize);
+      return self();
+    }
+
+    /**
+     * EXPERIMENTAL: See {@link ParquetProperties.Builder#withContentDefinedChunkingMaxSize(long)}.
+     *
+     * @param maxSize the maximum chunk size in bytes
+     * @return this builder for method chaining
+     */
+    public SELF withContentDefinedChunkingMaxSize(long maxSize) {
+      encodingPropsBuilder.withContentDefinedChunkingMaxSize(maxSize);
+      return self();
+    }
+
+    /**
+     * EXPERIMENTAL: See {@link ParquetProperties.Builder#withContentDefinedChunkingNormLevel(int)}.
+     *
+     * @param normLevel the normalization level
+     * @return this builder for method chaining
+     */
+    public SELF withContentDefinedChunkingNormLevel(int normLevel) {
+      encodingPropsBuilder.withContentDefinedChunkingNormLevel(normLevel);
+      return self();
+    }
+
+    /**
      * Set the Parquet format dictionary page size used by the constructed
      * writer.
      *
@@ -734,6 +781,36 @@ public class ParquetWriter<T> implements Closeable {
 
     public SELF withByteStreamSplitEncoding(String columnPath, boolean enableByteStreamSplit) {
       encodingPropsBuilder.withByteStreamSplitEncoding(columnPath, enableByteStreamSplit);
+      return self();
+    }
+
+    public SELF withAlp() {
+      encodingPropsBuilder.withAlp();
+      return self();
+    }
+
+    public SELF withAlp(AlpConfig config) {
+      encodingPropsBuilder.withAlp(config);
+      return self();
+    }
+
+    public SELF withAlp(String columnPath) {
+      encodingPropsBuilder.withAlp(columnPath);
+      return self();
+    }
+
+    public SELF withAlp(String columnPath, AlpConfig config) {
+      encodingPropsBuilder.withAlp(columnPath, config);
+      return self();
+    }
+
+    public SELF withoutAlp() {
+      encodingPropsBuilder.withoutAlp();
+      return self();
+    }
+
+    public SELF withoutAlp(String columnPath) {
+      encodingPropsBuilder.withoutAlp(columnPath);
       return self();
     }
 

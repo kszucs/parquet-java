@@ -284,6 +284,41 @@ true if the reader is using a `DirectByteBufferAllocator`
 
 ---
 
+**Property:** `parquet.content-defined-chunking.enabled`  
+**Description:** EXPERIMENTAL: Whether data pages also end at boundaries derived from a rolling hash of the
+column's values, so that files sharing a run of values share pages, which content addressable storage can
+deduplicate. Readers need no support. The boundaries are those of Arrow C++ and arrow-rs for the same values,
+except where Arrow holds them in another form, such as decimals, INT96 and dictionary arrays. The page size and
+row count limits still apply; a page the size limit splits may deduplicate less, as the cut can move after an edit.  
+With dictionary encoding, an edit that adds values renumbers the indices of values first seen after it. As
+parquet-java chooses between dictionary and plain encoding on the first page of a column chunk, which chunking can
+cut short, some column chunks fall back to plain encoding.  
+**Default value:** `false`
+
+---
+
+**Property:** `parquet.content-defined-chunking.min.size`  
+**Description:** EXPERIMENTAL: The minimum content defined chunk size in bytes, at least 0. Read only when content
+defined chunking is enabled.  
+**Default value:** `262144` (256 KiB)
+
+---
+
+**Property:** `parquet.content-defined-chunking.max.size`  
+**Description:** EXPERIMENTAL: The maximum content defined chunk size in bytes, greater than the minimum. Read only
+when content defined chunking is enabled.  
+**Default value:** `1048576` (1 MiB)
+
+---
+
+**Property:** `parquet.content-defined-chunking.norm.level`  
+**Description:** EXPERIMENTAL: The normalization level of the rolling hash mask. Raising it makes chunk sizes
+more uniform at the cost of more small pages. At level 0, 1 or 2 the maximum must exceed the minimum by at least
+32, 64 or 128 bytes. Read only when content defined chunking is enabled.  
+**Default value:** `0`
+
+---
+
 **Property:** `parquet.page.write-checksum.enabled`  
 **Description:** Whether to write out page level checksums.  
 **Default value:** `true`
@@ -402,6 +437,17 @@ ParquetInputFormat to materialize records. It should be a the descendant class o
 **Property:** `parquet.compression.codec.zstd.workers`  
 **Description:** The number of threads will be spawned to compress in parallel. More workers improve speed, but also increase memory usage. When it is 0, it works as single-threaded mode.  
 **Default value:** `0`
+
+## Class: ParquetReadOptions
+
+**Property:** `parquet.read.allocation.size`
+
+**Description:** Size in bytes used to split planned column-chunk ranges into read buffers.
+For vectored IO, this limits the length of each range requested from the filesystem.
+Filesystems may merge or align ranges for checksums and allocate larger buffers.
+This setting does not limit other allocations, such as footer reads or decoding, or total memory use.
+
+**Default value:** `8388608` (8 MiB)
 
 ## Class: HadoopReadOptions
 
@@ -544,6 +590,54 @@ If `false`, key material is stored in separate new files, created in the same fo
 If `true` then an attempt will be made to dynamically load the relevant classes; 
 if not found then the library will use the classic non-vectored reads: it is safe to enable this option on older releases.  
 **Default value:** `true`
+
+---
+
+**JVM system property:** `parquet.hadoop.vectored.io.threads`
+
+**Description:** Maximum number of workers in the default shared vectored-read pool. Set a positive integer
+with `-Dparquet.hadoop.vectored.io.threads=N` before the first vectored read; this is
+read once per JVM, not from the Hadoop configuration. Invalid values fail initialization.
+Readers without a caller-supplied executor share this limit. Waiting for a worker, submitting the read, and waiting
+for its results share the same 300-second deadline. If admission times out, the read
+fails before submitting filesystem work and the reader retains its stream.
+
+A worker remains occupied until submission returns, the caller transfers or abandons
+the buffers, and any failure cleanup closes the stream. A backend that ignores
+interruption therefore retains capacity; repeated timeouts cannot create workers
+beyond the configured limit. If all workers are blocked, further vectored reads time
+out waiting for capacity. Idle workers expire after 60 seconds. This limit does not
+bound threads created by the filesystem or total buffer memory.
+
+**Default value:** `64`
+
+Applications can supply their own executor through `ParquetReadOptions` (including
+`HadoopReadOptions`) or `ParquetReader.Builder.withVectoredReadExecutor` instead of
+using the default pool:
+
+```java
+ExecutorService ioPool = Executors.newFixedThreadPool(8);
+VectoredReadExecutor vectoredReads = new VectoredReadExecutor(ioPool, 8);
+ParquetReadOptions options = ParquetReadOptions.builder()
+    .withVectoredReadExecutor(vectoredReads)
+    .build();
+```
+
+Reuse the same `VectoredReadExecutor` across readers to share its admission limit.
+Copies of the read options retain that same instance. The limit bounds accepted
+vectored operations, including queued work and failure cleanup, independently of
+other tasks submitted to the underlying executor. A supplied executor bypasses the
+JVM default and its system property; passing `null` restores the default.
+
+The application owns the supplied executor: Parquet never shuts it down, including
+when a reader closes or fails. Its `execute` method must return promptly, run tasks asynchronously, and either accept
+them for execution or reject them with an exception, without silently dropping
+tasks. Inline execution (including `CallerRunsPolicy`) is rejected before filesystem
+submission. Reading threads must not occupy all of the supplied pool's workers
+while waiting for vectored reads on that same pool. After readers finish, use an
+orderly shutdown that drains accepted tasks; `shutdownNow()` or cancelling queued
+tasks can prevent deferred cleanup. Closing a failed reader does not imply that
+an interruption-ignoring backend or its cleanup has finished.
 
 ---
 

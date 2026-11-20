@@ -29,6 +29,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import org.apache.hadoop.fs.ByteBufferReadable;
 import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.StreamCapabilities;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.parquet.io.SeekableInputStream;
 import org.junit.jupiter.api.Test;
 
@@ -380,13 +382,71 @@ public class TestHadoop2ByteBufferReads {
   @Test
   public void testCreateStreamNoByteBufferReadable() {
     final SeekableInputStream s = wrap(new FSDataInputStream(new MockHadoopInputStream()));
-    assertThat(s).as("Wrong wrapper: " + s).isInstanceOf(H1SeekableInputStream.class);
+    assertThat(s).as("Wrong wrapper: " + s).isInstanceOf(H2SeekableInputStream.class);
   }
 
   @Test
   public void testDoubleWrapNoByteBufferReadable() {
     final SeekableInputStream s = wrap(new FSDataInputStream(new FSDataInputStream(new MockHadoopInputStream())));
-    assertThat(s).as("Wrong wrapper: " + s).isInstanceOf(H1SeekableInputStream.class);
+    assertThat(s).as("Wrong wrapper: " + s).isInstanceOf(H2SeekableInputStream.class);
+  }
+
+  /**
+   * A stream which is not ByteBufferReadable must fall back to byte-array reads
+   * rather than calling {@code FSDataInputStream.read(ByteBuffer)}, which would
+   * throw UnsupportedOperationException.
+   */
+  @Test
+  public void testHeapReadNoByteBufferReadable() throws Exception {
+    final SeekableInputStream s = wrap(new FSDataInputStream(new MockHadoopInputStream()));
+    final ByteBuffer readBuffer = ByteBuffer.allocate(20);
+
+    assertThat(s.read(readBuffer)).isEqualTo(10);
+    assertThat(readBuffer.position()).isEqualTo(10);
+    readBuffer.flip();
+    assertThat(readBuffer).as("Buffer contents should match").isEqualTo(ByteBuffer.wrap(TEST_ARRAY));
+  }
+
+  @Test
+  public void testDirectReadNoByteBufferReadable() throws Exception {
+    final SeekableInputStream s = wrap(new FSDataInputStream(new MockHadoopInputStream()));
+    final ByteBuffer readBuffer = ByteBuffer.allocateDirect(20);
+
+    assertThat(s.read(readBuffer)).isEqualTo(10);
+    assertThat(readBuffer.position()).isEqualTo(10);
+    readBuffer.flip();
+    assertThat(readBuffer).as("Buffer contents should match").isEqualTo(ByteBuffer.wrap(TEST_ARRAY));
+  }
+
+  @Test
+  public void testHeapReadFullyNoByteBufferReadable() throws Exception {
+    final SeekableInputStream s = wrap(new FSDataInputStream(new MockHadoopInputStream(2, 3)));
+    final ByteBuffer readBuffer = ByteBuffer.allocate(10);
+
+    s.readFully(readBuffer);
+    assertThat(readBuffer.position()).isEqualTo(10);
+    readBuffer.flip();
+    assertThat(readBuffer).as("Buffer contents should match").isEqualTo(ByteBuffer.wrap(TEST_ARRAY));
+  }
+
+  @Test
+  public void testDirectReadFullyNoByteBufferReadable() throws Exception {
+    final SeekableInputStream s =
+        wrap(new FSDataInputStream(new FSDataInputStream(new MockHadoopInputStream(2, 3))));
+    final ByteBuffer readBuffer = ByteBuffer.allocateDirect(10);
+
+    s.readFully(readBuffer);
+    assertThat(readBuffer.position()).isEqualTo(10);
+    readBuffer.flip();
+    assertThat(readBuffer).as("Buffer contents should match").isEqualTo(ByteBuffer.wrap(TEST_ARRAY));
+  }
+
+  @Test
+  public void testReadFullyPastEOFNoByteBufferReadable() {
+    final SeekableInputStream s = wrap(new FSDataInputStream(new MockHadoopInputStream()));
+    final ByteBuffer readBuffer = ByteBuffer.allocate(20);
+
+    assertThatThrownBy(() -> s.readFully(readBuffer)).isInstanceOf(EOFException.class);
   }
 
   @Test
@@ -403,13 +463,20 @@ public class TestHadoop2ByteBufferReads {
   }
 
   /**
-   * Input stream which claims to implement ByteBufferReadable.
+   * Input stream which claims to implement ByteBufferReadable in both interfaces and
+   * in {@code hasCapability()}.
    */
-  private static final class MockByteBufferInputStream extends MockHadoopInputStream implements ByteBufferReadable {
+  private static final class MockByteBufferInputStream extends MockHadoopInputStream
+      implements ByteBufferReadable, StreamCapabilities {
 
     @Override
     public int read(final ByteBuffer buf) {
       return 0;
+    }
+
+    @Override
+    public boolean hasCapability(final String capability) {
+      return StringUtils.toLowerCase(capability).equals(READBYTEBUFFER);
     }
   }
 }

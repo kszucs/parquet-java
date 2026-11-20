@@ -21,7 +21,6 @@ package org.apache.parquet.hadoop;
 import static org.apache.parquet.column.ParquetProperties.DEFAULT_ADAPTIVE_BLOOM_FILTER_ENABLED;
 import static org.apache.parquet.column.ParquetProperties.DEFAULT_BLOOM_FILTER_ENABLED;
 import static org.apache.parquet.hadoop.ParquetWriter.DEFAULT_BLOCK_SIZE;
-import static org.apache.parquet.hadoop.util.ContextUtil.getConfiguration;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -164,6 +163,11 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   public static final String STATISTICS_ENABLED = "parquet.column.statistics.enabled";
   public static final String SIZE_STATISTICS_ENABLED = "parquet.size.statistics.enabled";
   public static final String COLUMN_COMPRESSION_LEVEL_PREFIX = "parquet.compression.level";
+  // EXPERIMENTAL: see ParquetProperties.Builder#withContentDefinedChunking
+  public static final String CONTENT_DEFINED_CHUNKING_ENABLED = "parquet.content-defined-chunking.enabled";
+  public static final String CONTENT_DEFINED_CHUNKING_MIN_SIZE = "parquet.content-defined-chunking.min.size";
+  public static final String CONTENT_DEFINED_CHUNKING_MAX_SIZE = "parquet.content-defined-chunking.max.size";
+  public static final String CONTENT_DEFINED_CHUNKING_NORM_LEVEL = "parquet.content-defined-chunking.norm.level";
 
   public static JobSummaryLevel getJobSummaryLevel(Configuration conf) {
     String level = conf.get(JOB_SUMMARY_LEVEL);
@@ -190,7 +194,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setWriteSupportClass(Job job, Class<?> writeSupportClass) {
-    getConfiguration(job).set(WRITE_SUPPORT_CLASS, writeSupportClass.getName());
+    job.getConfiguration().set(WRITE_SUPPORT_CLASS, writeSupportClass.getName());
   }
 
   public static void setWriteSupportClass(JobConf job, Class<?> writeSupportClass) {
@@ -208,35 +212,35 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setBlockSize(Job job, int blockSize) {
-    getConfiguration(job).setInt(BLOCK_SIZE, blockSize);
+    job.getConfiguration().setInt(BLOCK_SIZE, blockSize);
   }
 
   public static void setPageSize(Job job, int pageSize) {
-    getConfiguration(job).setInt(PAGE_SIZE, pageSize);
+    job.getConfiguration().setInt(PAGE_SIZE, pageSize);
   }
 
   public static void setDictionaryPageSize(Job job, int pageSize) {
-    getConfiguration(job).setInt(DICTIONARY_PAGE_SIZE, pageSize);
+    job.getConfiguration().setInt(DICTIONARY_PAGE_SIZE, pageSize);
   }
 
   public static void setCompression(Job job, CompressionCodecName compression) {
-    getConfiguration(job).set(COMPRESSION, compression.name());
+    job.getConfiguration().set(COMPRESSION, compression.name());
   }
 
   public static void setColumnCompression(Job job, String columnPath, CompressionCodecName codec) {
-    getConfiguration(job).set(COMPRESSION + '#' + columnPath, codec.name());
+    job.getConfiguration().set(COMPRESSION + '#' + columnPath, codec.name());
   }
 
   public static void setColumnCompressionLevel(Job job, String columnPath, int level) {
-    getConfiguration(job).setInt(COLUMN_COMPRESSION_LEVEL_PREFIX + '#' + columnPath, level);
+    job.getConfiguration().setInt(COLUMN_COMPRESSION_LEVEL_PREFIX + '#' + columnPath, level);
   }
 
   public static void setEnableDictionary(Job job, boolean enableDictionary) {
-    getConfiguration(job).setBoolean(ENABLE_DICTIONARY, enableDictionary);
+    job.getConfiguration().setBoolean(ENABLE_DICTIONARY, enableDictionary);
   }
 
   public static boolean getEnableDictionary(JobContext jobContext) {
-    return getEnableDictionary(getConfiguration(jobContext));
+    return getEnableDictionary(jobContext.getConfiguration());
   }
 
   public static int getBloomFilterMaxBytes(Configuration conf) {
@@ -252,31 +256,31 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static int getBlockSize(JobContext jobContext) {
-    return getBlockSize(getConfiguration(jobContext));
+    return getBlockSize(jobContext.getConfiguration());
   }
 
   public static int getPageSize(JobContext jobContext) {
-    return getPageSize(getConfiguration(jobContext));
+    return getPageSize(jobContext.getConfiguration());
   }
 
   public static int getDictionaryPageSize(JobContext jobContext) {
-    return getDictionaryPageSize(getConfiguration(jobContext));
+    return getDictionaryPageSize(jobContext.getConfiguration());
   }
 
   public static CompressionCodecName getCompression(JobContext jobContext) {
-    return getCompression(getConfiguration(jobContext));
+    return getCompression(jobContext.getConfiguration());
   }
 
   public static boolean isCompressionSet(JobContext jobContext) {
-    return isCompressionSet(getConfiguration(jobContext));
+    return isCompressionSet(jobContext.getConfiguration());
   }
 
   public static void setValidation(JobContext jobContext, boolean validating) {
-    setValidation(getConfiguration(jobContext), validating);
+    setValidation(jobContext.getConfiguration(), validating);
   }
 
   public static boolean getValidation(JobContext jobContext) {
-    return getValidation(getConfiguration(jobContext));
+    return getValidation(jobContext.getConfiguration());
   }
 
   public static boolean getEnableDictionary(Configuration configuration) {
@@ -350,7 +354,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setMaxPaddingSize(JobContext jobContext, int maxPaddingSize) {
-    setMaxPaddingSize(getConfiguration(jobContext), maxPaddingSize);
+    setMaxPaddingSize(jobContext.getConfiguration(), maxPaddingSize);
   }
 
   public static void setMaxPaddingSize(Configuration conf, int maxPaddingSize) {
@@ -362,7 +366,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setColumnIndexTruncateLength(JobContext jobContext, int length) {
-    setColumnIndexTruncateLength(getConfiguration(jobContext), length);
+    setColumnIndexTruncateLength(jobContext.getConfiguration(), length);
   }
 
   public static void setColumnIndexTruncateLength(Configuration conf, int length) {
@@ -374,7 +378,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setStatisticsTruncateLength(JobContext jobContext, int length) {
-    setStatisticsTruncateLength(getConfiguration(jobContext), length);
+    setStatisticsTruncateLength(jobContext.getConfiguration(), length);
   }
 
   private static void setStatisticsTruncateLength(Configuration conf, int length) {
@@ -386,7 +390,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setBlockRowCountLimit(JobContext jobContext, int rowCount) {
-    setBlockRowCountLimit(getConfiguration(jobContext), rowCount);
+    setBlockRowCountLimit(jobContext.getConfiguration(), rowCount);
   }
 
   public static void setBlockRowCountLimit(Configuration conf, int rowCount) {
@@ -398,7 +402,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setPageRowCountLimit(JobContext jobContext, int rowCount) {
-    setPageRowCountLimit(getConfiguration(jobContext), rowCount);
+    setPageRowCountLimit(jobContext.getConfiguration(), rowCount);
   }
 
   public static void setPageRowCountLimit(Configuration conf, int rowCount) {
@@ -410,7 +414,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setPageWriteChecksumEnabled(JobContext jobContext, boolean val) {
-    setPageWriteChecksumEnabled(getConfiguration(jobContext), val);
+    setPageWriteChecksumEnabled(jobContext.getConfiguration(), val);
   }
 
   public static void setPageWriteChecksumEnabled(Configuration conf, boolean val) {
@@ -422,7 +426,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setStatisticsEnabled(JobContext jobContext, boolean enabled) {
-    getConfiguration(jobContext).setBoolean(STATISTICS_ENABLED, enabled);
+    jobContext.getConfiguration().setBoolean(STATISTICS_ENABLED, enabled);
   }
 
   public static boolean getStatisticsEnabled(Configuration conf) {
@@ -430,7 +434,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   }
 
   public static void setStatisticsEnabled(JobContext jobContext, String columnPath, boolean enabled) {
-    getConfiguration(jobContext).set(STATISTICS_ENABLED + "#" + columnPath, String.valueOf(enabled));
+    jobContext.getConfiguration().set(STATISTICS_ENABLED + "#" + columnPath, String.valueOf(enabled));
   }
 
   public static boolean getStatisticsEnabled(Configuration conf, String columnPath) {
@@ -490,7 +494,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
   public RecordWriter<Void, T> getRecordWriter(TaskAttemptContext taskAttemptContext, Mode mode)
       throws IOException, InterruptedException {
 
-    final Configuration conf = getConfiguration(taskAttemptContext);
+    final Configuration conf = taskAttemptContext.getConfiguration();
 
     CompressionCodecName codec = getCodec(taskAttemptContext);
     String extension = codec.getExtension() + ".parquet";
@@ -505,7 +509,7 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
 
   public RecordWriter<Void, T> getRecordWriter(TaskAttemptContext taskAttemptContext, Path file, Mode mode)
       throws IOException, InterruptedException {
-    return getRecordWriter(getConfiguration(taskAttemptContext), file, getCodec(taskAttemptContext), mode);
+    return getRecordWriter(taskAttemptContext.getConfiguration(), file, getCodec(taskAttemptContext), mode);
   }
 
   public RecordWriter<Void, T> getRecordWriter(Configuration conf, Path file, CompressionCodecName codec)
@@ -535,7 +539,15 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
         .withRowGroupRowCountLimit(getBlockRowCountLimit(conf))
         .withPageRowCountLimit(getPageRowCountLimit(conf))
         .withPageWriteChecksumEnabled(getPageWriteChecksumEnabled(conf))
-        .withStatisticsEnabled(getStatisticsEnabled(conf));
+        .withStatisticsEnabled(getStatisticsEnabled(conf))
+        .withContentDefinedChunking(conf.getBoolean(CONTENT_DEFINED_CHUNKING_ENABLED, false))
+        .withContentDefinedChunkingMinSize(conf.getLong(
+            CONTENT_DEFINED_CHUNKING_MIN_SIZE, ParquetProperties.DEFAULT_CONTENT_DEFINED_CHUNKING_MIN_SIZE))
+        .withContentDefinedChunkingMaxSize(conf.getLong(
+            CONTENT_DEFINED_CHUNKING_MAX_SIZE, ParquetProperties.DEFAULT_CONTENT_DEFINED_CHUNKING_MAX_SIZE))
+        .withContentDefinedChunkingNormLevel(conf.getInt(
+            CONTENT_DEFINED_CHUNKING_NORM_LEVEL,
+            ParquetProperties.DEFAULT_CONTENT_DEFINED_CHUNKING_NORM_LEVEL));
     new ColumnConfigParser()
         .withColumnConfig(
             ENABLE_DICTIONARY, key -> conf.getBoolean(key, false), propsBuilder::withDictionaryEncoding)
@@ -628,8 +640,9 @@ public class ParquetOutputFormat<T> extends FileOutputFormat<Void, T> {
     Class<?> writeSupportClass = getWriteSupportClass(configuration);
     try {
       return (WriteSupport<T>) Objects.requireNonNull(writeSupportClass, "writeSupportClass cannot be null")
+          .getDeclaredConstructor()
           .newInstance();
-    } catch (InstantiationException | IllegalAccessException e) {
+    } catch (ReflectiveOperationException e) {
       throw new BadConfigurationException("could not instantiate write support class: " + writeSupportClass, e);
     }
   }

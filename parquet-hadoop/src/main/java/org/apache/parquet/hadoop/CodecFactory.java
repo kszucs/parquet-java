@@ -41,6 +41,7 @@ import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.compression.CompressionCodecFactory;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
+import org.apache.parquet.hadoop.codec.BrotliCodec;
 import org.apache.parquet.hadoop.codec.Lz4RawCodec;
 import org.apache.parquet.hadoop.codec.ZstandardCodec;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
@@ -178,7 +179,13 @@ public class CodecFactory implements CompressionCodecFactory {
       if (decompressor != null) {
         decompressor.reset();
       }
-      InputStream is = codec.createInputStream(bytes.toInputStream(), decompressor);
+      InputStream is;
+      if (codec instanceof BrotliCodec) {
+        // Brotli is decoded in one shot; bound the output by the size declared in the page header.
+        is = ((BrotliCodec) codec).createInputStream(bytes.toInputStream(), decompressedSize);
+      } else {
+        is = codec.createInputStream(bytes.toInputStream(), decompressor);
+      }
 
       // Eagerly materialize the decompressed stream for codecs that require all input in a single buffer.
       // ZSTD: releases off-heap resources early to avoid fragmentation (see parquet-format#398).
@@ -464,7 +471,12 @@ public class CodecFactory implements CompressionCodecFactory {
 
   private String cacheKey(CompressionCodecName codecName, int level) {
     String codecClass = codecName.getHadoopCompressionCodecClassName();
-    return (codecClass == null ? codecName.name() : codecClass) + ":" + level;
+    // Use a distinct namespace ("#level=") for the leveled path so that this key can never
+    // collide with the no-level cacheKey(codecName), which appends the raw configuration value
+    // (e.g. "<codecClass>:5" when zlib.compress.level=5 is set directly). Both maps that use
+    // these keys (the per-factory compressors map and the shared static CODEC_BY_NAME) would
+    // otherwise return a codec built from the raw config instead of the level-configured one.
+    return (codecClass == null ? codecName.name() : codecClass) + "#level=" + level;
   }
 
   @Override

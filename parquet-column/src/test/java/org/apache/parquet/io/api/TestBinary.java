@@ -37,7 +37,6 @@ import org.junit.jupiter.api.Test;
 public class TestBinary {
 
   private static final String testString = "test-123";
-  private static final String UTF8 = "UTF-8";
 
   static interface BinaryFactory {
     static class BinaryAndOriginal {
@@ -130,7 +129,7 @@ public class TestBinary {
   private static final BinaryFactory STRING_BF = new BinaryFactory() {
     @Override
     public BinaryAndOriginal get(byte[] bytes, boolean reused) throws Exception {
-      Binary b = Binary.fromString(new String(bytes, UTF8));
+      Binary b = Binary.fromString(new String(bytes, StandardCharsets.UTF_8));
       return new BinaryAndOriginal(b, b.getBytesUnsafe()); // only way to get underlying bytes for testing
     }
   };
@@ -185,7 +184,7 @@ public class TestBinary {
   public void testDirectByteBufferCopyAlwaysMaterializesToHeap() throws Exception {
     // For constant (non-reused) direct ByteBuffers, copy() must return a new Binary
     // rather than 'this', because the direct memory can be freed independently.
-    byte[] data = testString.getBytes(UTF8);
+    byte[] data = testString.getBytes(StandardCharsets.UTF_8);
     ByteBuffer direct = ByteBuffer.allocateDirect(data.length);
     direct.put(data);
     direct.flip();
@@ -205,7 +204,7 @@ public class TestBinary {
   public void testDirectByteBufferCopyIsIndependentOfOriginalBuffer() throws Exception {
     // Verify the copied Binary is independent of the original direct ByteBuffer.
     // Simulates the scenario where direct memory is overwritten after copy.
-    byte[] data = testString.getBytes(UTF8);
+    byte[] data = testString.getBytes(StandardCharsets.UTF_8);
     ByteBuffer direct = ByteBuffer.allocateDirect(data.length);
     direct.put(data);
     direct.flip();
@@ -227,7 +226,7 @@ public class TestBinary {
   @Test
   public void testHeapByteBufferConstantCopyReturnsSame() throws Exception {
     // For heap-backed constant ByteBuffers, copy() should return 'this' (existing behavior)
-    byte[] data = testString.getBytes(UTF8);
+    byte[] data = testString.getBytes(StandardCharsets.UTF_8);
     ByteBuffer heap = ByteBuffer.wrap(data);
 
     Binary binary = Binary.fromConstantByteBuffer(heap);
@@ -243,6 +242,29 @@ public class TestBinary {
     Binary bin1 = Binary.fromConstantByteArray("alice".getBytes(), 1, 3);
     Binary bin2 = Binary.fromConstantByteBuffer(ByteBuffer.wrap("alice".getBytes(), 1, 3));
     assertThat(bin2).isEqualTo(bin1);
+  }
+
+  @Test
+  public void testDirectByteBufferEqualityWithOffset() {
+    ByteBuffer slicedBuffer = ByteBuffer.allocateDirect(3);
+    slicedBuffer.put(new byte[] {9, 1, 2});
+    slicedBuffer.position(1);
+    Binary sliced = Binary.fromConstantByteBuffer(slicedBuffer);
+
+    ByteBuffer equalBuffer = ByteBuffer.allocateDirect(2);
+    equalBuffer.put(new byte[] {1, 2});
+    equalBuffer.flip();
+    Binary equal = Binary.fromConstantByteBuffer(equalBuffer);
+
+    ByteBuffer differentBuffer = ByteBuffer.allocateDirect(2);
+    differentBuffer.put(new byte[] {9, 1});
+    differentBuffer.flip();
+    Binary different = Binary.fromConstantByteBuffer(differentBuffer);
+
+    assertThat(sliced).isEqualTo(equal);
+    assertThat(equal).isEqualTo(sliced);
+    assertThat(sliced.hashCode()).isEqualTo(equal.hashCode());
+    assertThat(different).isNotEqualTo(sliced);
   }
 
   @Test
@@ -267,22 +289,23 @@ public class TestBinary {
   }
 
   private void testSlice(BinaryFactory bf, boolean reused) throws Exception {
-    BinaryAndOriginal bao = bf.get(testString.getBytes(UTF8), reused);
+    BinaryAndOriginal bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), reused);
 
-    assertThat(bao.binary.slice(0, testString.length()).getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.slice(5, 3).getBytesUnsafe()).isEqualTo("123".getBytes(UTF8));
+    assertThat(bao.binary.slice(0, testString.length()).getBytesUnsafe())
+        .isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.slice(5, 3).getBytesUnsafe()).isEqualTo("123".getBytes(StandardCharsets.UTF_8));
   }
 
   private void testConstantCopy(BinaryFactory bf) throws Exception {
-    BinaryAndOriginal bao = bf.get(testString.getBytes(UTF8), false);
+    BinaryAndOriginal bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), false);
     assertThat(bao.binary.isBackingBytesReused()).isFalse();
 
-    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(UTF8));
+    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
 
-    bao = bf.get(testString.getBytes(UTF8), false);
+    bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), false);
     assertThat(bao.binary.isBackingBytesReused()).isFalse();
 
     Binary copy = bao.binary.copy();
@@ -291,24 +314,24 @@ public class TestBinary {
   }
 
   private void testReusedCopy(BinaryFactory bf) throws Exception {
-    BinaryAndOriginal bao = bf.get(testString.getBytes(UTF8), true);
+    BinaryAndOriginal bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), true);
     assertThat(bao.binary.isBackingBytesReused()).isTrue();
 
-    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(UTF8));
+    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
 
-    bao = bf.get(testString.getBytes(UTF8), true);
+    bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), true);
     assertThat(bao.binary.isBackingBytesReused()).isTrue();
 
     Binary copy = bao.binary.copy();
     mutate(bao.original);
 
-    assertThat(copy.getBytes()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(copy.getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(copy.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(copy.copy().getBytes()).isEqualTo(testString.getBytes(UTF8));
+    assertThat(copy.getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(copy.getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(copy.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(copy.copy().getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
   }
 
   /**
@@ -317,15 +340,15 @@ public class TestBinary {
    * memory can be freed independently.
    */
   private void testDirectConstantCopy(BinaryFactory bf) throws Exception {
-    BinaryAndOriginal bao = bf.get(testString.getBytes(UTF8), false);
+    BinaryAndOriginal bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), false);
     assertThat(bao.binary.isBackingBytesReused()).isFalse();
 
-    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(UTF8));
+    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
 
-    bao = bf.get(testString.getBytes(UTF8), false);
+    bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), false);
     assertThat(bao.binary.isBackingBytesReused()).isFalse();
 
     Binary copy = bao.binary.copy();
@@ -341,28 +364,28 @@ public class TestBinary {
    * The copy must be fully independent and survive mutation of the original buffer.
    */
   private void testDirectReusedCopy(BinaryFactory bf) throws Exception {
-    BinaryAndOriginal bao = bf.get(testString.getBytes(UTF8), true);
+    BinaryAndOriginal bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), true);
     assertThat(bao.binary.isBackingBytesReused()).isTrue();
 
-    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(UTF8));
+    assertThat(bao.binary.getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(bao.binary.copy().getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
 
-    bao = bf.get(testString.getBytes(UTF8), true);
+    bao = bf.get(testString.getBytes(StandardCharsets.UTF_8), true);
     assertThat(bao.binary.isBackingBytesReused()).isTrue();
 
     Binary copy = bao.binary.copy();
     assertThat(bao.binary).isNotSameAs(copy);
 
-    assertThat(copy.getBytes()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(copy.getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(copy.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(UTF8));
-    assertThat(copy.copy().getBytes()).isEqualTo(testString.getBytes(UTF8));
+    assertThat(copy.getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(copy.getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(copy.copy().getBytesUnsafe()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
+    assertThat(copy.copy().getBytes()).isEqualTo(testString.getBytes(StandardCharsets.UTF_8));
   }
 
   private void testSerializable(BinaryFactory bf, boolean reused) throws Exception {
-    BinaryAndOriginal bao = bf.get("polygon".getBytes(UTF8), reused);
+    BinaryAndOriginal bao = bf.get("polygon".getBytes(StandardCharsets.UTF_8), reused);
 
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
     ObjectOutputStream out = new ObjectOutputStream(baos);

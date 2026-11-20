@@ -23,12 +23,14 @@ import static java.lang.Math.min;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.ColumnWriteStore;
 import org.apache.parquet.column.ParquetProperties;
+import org.apache.parquet.column.impl.ContentDefinedChunker;
 import org.apache.parquet.column.values.bloomfilter.BloomFilterWriteStore;
 import org.apache.parquet.compression.CompressionCodecFactory.BytesInputCompressor;
 import org.apache.parquet.crypto.InternalFileEncryptor;
@@ -50,7 +52,14 @@ class InternalParquetRecordWriter<T> {
   private final WriteSupport<T> writeSupport;
   private final MessageType schema;
   private final Map<String, String> extraMetaData;
-  private long rowGroupSizeThreshold;
+  // The row group size requested for this writer. MemoryManager may scale this down when the
+  // total allocation across all writers in the JVM exceeds its pool; rather than having
+  // MemoryManager push a recomputed value into every writer on every writer added/removed
+  // elsewhere (which was the O(N)-per-call bottleneck behind PARQUET-2412), this value stays
+  // fixed and the effective, possibly-scaled threshold is computed on demand in
+  // getRowGroupSizeThreshold().
+  private final long rowGroupSizeThreshold;
+  private MemoryManager memoryManager;
   private final int rowGroupRecordCountThreshold;
   private long nextRowGroupSize;
   private final Function<ColumnDescriptor, BytesInputCompressor> compressorProvider;
@@ -64,6 +73,8 @@ class InternalParquetRecordWriter<T> {
   private long lastRowGroupEndPos = 0;
 
   private ColumnWriteStore columnStore;
+  // Continued by every row group of the file; null unless content defined chunking is enabled.
+  private final List<ContentDefinedChunker> contentDefinedChunkers;
   private ColumnChunkPageWriteStore pageStore;
   private BloomFilterWriteStore bloomFilterWriteStore;
   private RecordConsumer recordConsumer;
@@ -100,6 +111,8 @@ class InternalParquetRecordWriter<T> {
     this.props = props;
     this.fileEncryptor = parquetFileWriter.getEncryptor();
     this.rowGroupOrdinal = 0;
+    this.contentDefinedChunkers =
+        props.isContentDefinedChunkingEnabled() ? ContentDefinedChunker.forColumns(schema, props) : null;
     initStore();
     recordCountForNextMemCheck = props.getMinRowCountForPageSizeCheck();
   }
@@ -121,7 +134,7 @@ class InternalParquetRecordWriter<T> {
     pageStore = columnChunkPageWriteStore;
     bloomFilterWriteStore = columnChunkPageWriteStore;
 
-    columnStore = props.newColumnWriteStore(schema, pageStore, bloomFilterWriteStore);
+    columnStore = props.newColumnWriteStore(schema, pageStore, bloomFilterWriteStore, contentDefinedChunkers);
     MessageColumnIO columnIO = new ColumnIOFactory(validating).getColumnIO(schema);
     this.recordConsumer = columnIO.getRecordWriter(columnStore);
     writeSupport.prepareForWrite(recordConsumer);
@@ -143,9 +156,10 @@ class InternalParquetRecordWriter<T> {
         }
         finalMetadata.putAll(finalWriteContext.getExtraMetaData());
         parquetFileWriter.end(finalMetadata);
-      } catch (Exception e) {
+        lastRowGroupEndPos = parquetFileWriter.getPos();
+      } catch (Throwable t) {
         parquetFileWriter.abort();
-        throw e;
+        throw t;
       } finally {
         AutoCloseables.uncheckedClose(columnStore, pageStore, bloomFilterWriteStore, parquetFileWriter);
         closed = true;
@@ -171,7 +185,7 @@ class InternalParquetRecordWriter<T> {
    * @return the total size of data written to the file and buffered in memory
    */
   public long getDataSize() {
-    return lastRowGroupEndPos + columnStore.getBufferedSize();
+    return lastRowGroupEndPos + (columnStore == null ? 0 : columnStore.getBufferedSize());
   }
 
   private void checkBlockSizeReached() throws IOException {
@@ -221,7 +235,7 @@ class InternalParquetRecordWriter<T> {
     try {
       recordConsumer.flush();
       LOG.debug("Flushing mem columnStore to file. allocated memory: {}", columnStore.getAllocatedSize());
-      if (columnStore.getAllocatedSize() > (3 * rowGroupSizeThreshold)) {
+      if (columnStore.getAllocatedSize() > (3 * getRowGroupSizeThreshold())) {
         LOG.warn("Too much memory used: {}", columnStore.memUsageString());
       }
 
@@ -232,7 +246,7 @@ class InternalParquetRecordWriter<T> {
         pageStore.flushToFileWriter(parquetFileWriter);
         recordCount = 0;
         parquetFileWriter.endBlock();
-        this.nextRowGroupSize = Math.min(parquetFileWriter.getNextRowGroupSize(), rowGroupSizeThreshold);
+        this.nextRowGroupSize = Math.min(parquetFileWriter.getNextRowGroupSize(), getRowGroupSizeThreshold());
       }
     } finally {
       AutoCloseables.uncheckedClose(columnStore, pageStore, bloomFilterWriteStore);
@@ -242,12 +256,18 @@ class InternalParquetRecordWriter<T> {
     }
   }
 
-  long getRowGroupSizeThreshold() {
-    return rowGroupSizeThreshold;
+  void setMemoryManager(MemoryManager memoryManager) {
+    this.memoryManager = memoryManager;
   }
 
-  void setRowGroupSizeThreshold(long rowGroupSizeThreshold) {
-    this.rowGroupSizeThreshold = rowGroupSizeThreshold;
+  /**
+   * @return the row group size requested at construction, scaled down by the owning
+   * MemoryManager's current scale factor if one is attached.
+   */
+  long getRowGroupSizeThreshold() {
+    return memoryManager == null
+        ? rowGroupSizeThreshold
+        : (long) Math.floor(rowGroupSizeThreshold * memoryManager.getScale());
   }
 
   MessageType getSchema() {

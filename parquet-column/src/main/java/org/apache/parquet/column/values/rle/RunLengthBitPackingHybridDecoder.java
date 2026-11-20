@@ -80,6 +80,33 @@ public class RunLengthBitPackingHybridDecoder {
     return result;
   }
 
+  /**
+   * Skip {@code n} values without returning them. Runs are decoded normally, but the values are
+   * dropped instead of being handed back one-by-one via {@link #readInt()}, which saves the
+   * per-value branch on {@link #mode} and the array-index arithmetic that {@code readInt()} does.
+   *
+   * <p>Intended for callers that filter rows (column-index row ranges, hash-join probe filtering,
+   * etc.) and need to advance past many values on a dictionary-key or level column cheaply.
+   *
+   * @param n number of values to skip; must be non-negative
+   */
+  public void skipInts(int n) throws IOException {
+    Preconditions.checkArgument(n >= 0, "n must be non-negative");
+    while (n > 0) {
+      if (currentCount == 0) {
+        readNext();
+      }
+      int consume = Math.min(n, currentCount);
+      if (mode == MODE.PACKED) {
+        // The run is already unpacked into currentBuffer; skipping must advance the read
+        // position too, otherwise a later readInt() re-reads the values we just dropped.
+        currentBufferPosition += consume;
+      }
+      currentCount -= consume;
+      n -= consume;
+    }
+  }
+
   private void readNext() throws IOException {
     Preconditions.checkArgument(in.available() > 0, "Reading past RLE/BitPacking stream.");
     final int header = BytesUtils.readUnsignedVarInt(in);
@@ -87,11 +114,17 @@ public class RunLengthBitPackingHybridDecoder {
     switch (mode) {
       case RLE:
         currentCount = header >>> 1;
+        if (currentCount == 0) {
+          throw new ParquetDecodingException("Invalid RLE run with a repeat count of 0");
+        }
         LOG.debug("reading {} values RLE", currentCount);
         currentValue = BytesUtils.readIntLittleEndianPaddedOnBitWidth(in, bitWidth);
         break;
       case PACKED:
         int numGroups = header >>> 1;
+        if (numGroups == 0) {
+          throw new ParquetDecodingException("Invalid bit-packed run with 0 groups of 8 values");
+        }
         currentCount = numGroups * 8;
         LOG.debug("reading {} values BIT PACKED", currentCount);
         if (currentBuffer.length < currentCount) {

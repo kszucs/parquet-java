@@ -56,7 +56,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -68,6 +68,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.FixedBinaryTestUtils;
@@ -93,6 +94,7 @@ import org.apache.parquet.crypto.FileDecryptionProperties;
 import org.apache.parquet.crypto.InternalFileDecryptor;
 import org.apache.parquet.example.Paper;
 import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.NanoTime;
 import org.apache.parquet.example.data.simple.SimpleGroup;
 import org.apache.parquet.format.BoundingBox;
 import org.apache.parquet.format.ColumnChunk;
@@ -143,6 +145,8 @@ import org.apache.parquet.schema.Type.Repetition;
 import org.apache.parquet.schema.Types;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 public class TestParquetMetadataConverter {
   private static SecureRandom random = new SecureRandom();
@@ -573,12 +577,10 @@ public class TestParquetMetadataConverter {
   }
 
   @Test
-  public void testFileLogicalTypeIsIgnoredRatherThanFailing() {
+  public void testFileLogicalTypeIsConverted() {
     ParquetMetadataConverter converter = new ParquetMetadataConverter();
-    // FILE has no LogicalTypeAnnotation yet, so it must degrade to the physical type the way an
-    // unrecognised logical type does, rather than throwing.
     assertThat(converter.getLogicalTypeAnnotation(LogicalType.FILE(new FileType())))
-        .isNull();
+        .isEqualTo(LogicalTypeAnnotation.fileType());
   }
 
   @Test
@@ -589,11 +591,6 @@ public class TestParquetMetadataConverter {
           .isEqualTo(encoding);
     }
     for (org.apache.parquet.format.Encoding encoding : org.apache.parquet.format.Encoding.values()) {
-      // ALP is in the format spec but is not implemented on the Java side yet, so it has no
-      // org.apache.parquet.column.Encoding to round trip through. Remove this once it does.
-      if (encoding == org.apache.parquet.format.Encoding.ALP) {
-        continue;
-      }
       assertThat(parquetMetadataConverter.getEncoding(parquetMetadataConverter.getEncoding(encoding)))
           .isEqualTo(encoding);
     }
@@ -984,11 +981,11 @@ public class TestParquetMetadataConverter {
       assertThat(formatStats.getMin_value()).isNull();
       assertThat(formatStats.getMax_value()).isNull();
     } else {
-      String minString = new String(min, Charset.forName("UTF-8"));
-      String minStatString = new String(formatStats.getMin_value(), Charset.forName("UTF-8"));
+      String minString = new String(min, StandardCharsets.UTF_8);
+      String minStatString = new String(formatStats.getMin_value(), StandardCharsets.UTF_8);
       assertThat(minStatString.compareTo(minString)).isLessThanOrEqualTo(0);
-      String maxString = new String(max, Charset.forName("UTF-8"));
-      String maxStatString = new String(formatStats.getMax_value(), Charset.forName("UTF-8"));
+      String maxString = new String(max, StandardCharsets.UTF_8);
+      String maxStatString = new String(formatStats.getMax_value(), StandardCharsets.UTF_8);
       assertThat(maxStatString.compareTo(maxString)).isGreaterThanOrEqualTo(0);
     }
   }
@@ -1321,9 +1318,11 @@ public class TestParquetMetadataConverter {
         new BigInteger("12345678"),
         new BigInteger("12345679"));
     testSkippedV2Stats(
-        Types.optional(PrimitiveTypeName.INT96).named(""),
-        new BigInteger("-75687987"),
-        new BigInteger("45367657"));
+        Types.optional(PrimitiveTypeName.INT96)
+            .columnOrder(ColumnOrder.undefined())
+            .named(""),
+        new NanoTime(2458850, 0L),
+        new NanoTime(2458881, 39_600_000_000_000L));
   }
 
   private void testSkippedV2Stats(PrimitiveType type, Object min, Object max) {
@@ -1362,6 +1361,10 @@ public class TestParquetMetadataConverter {
             .named(""),
         new BigInteger("-6769643"),
         new BigInteger("9864675"));
+    testV2OnlyStats(
+        Types.optional(PrimitiveTypeName.INT96).named(""),
+        new NanoTime(2458850, 0L), // 2020-01-01
+        new NanoTime(2458881, 39_600_000_000_000L)); // 2020-02-01T11:00
   }
 
   private void testV2OnlyStats(PrimitiveType type, Object min, Object max) {
@@ -1400,10 +1403,8 @@ public class TestParquetMetadataConverter {
             .named(""),
         new BigInteger("-8752832"),
         new BigInteger("-8752832"));
-    testV2StatsEqualMinMax(
-        Types.optional(PrimitiveTypeName.INT96).named(""),
-        new BigInteger("81032984"),
-        new BigInteger("81032984"));
+    NanoTime int96 = new NanoTime(2458850, 43_200_000_000_000L); // 2020-01-01T12:00:00
+    testV2StatsEqualMinMax(Types.optional(PrimitiveTypeName.INT96).named(""), int96, int96);
   }
 
   private void testV2StatsEqualMinMax(PrimitiveType type, Object min, Object max) {
@@ -1423,6 +1424,8 @@ public class TestParquetMetadataConverter {
       return createStatsTyped(type, (Long) min, (Long) max);
     } else if (c == BigInteger.class) {
       return createStatsTyped(type, (BigInteger) min, (BigInteger) max);
+    } else if (min instanceof NanoTime) {
+      return createStatsTyped(type, (NanoTime) min, (NanoTime) max);
     }
     fail("Not implemented");
     return null;
@@ -1450,6 +1453,17 @@ public class TestParquetMetadataConverter {
     Statistics<?> stats = Statistics.createStats(type);
     Binary minBinary = FixedBinaryTestUtils.getFixedBinary(type, min);
     Binary maxBinary = FixedBinaryTestUtils.getFixedBinary(type, max);
+    stats.updateStats(maxBinary);
+    stats.updateStats(minBinary);
+    assertThat(stats.genericGetMin()).isEqualTo(minBinary);
+    assertThat(stats.genericGetMax()).isEqualTo(maxBinary);
+    return stats;
+  }
+
+  private static Statistics<?> createStatsTyped(PrimitiveType type, NanoTime min, NanoTime max) {
+    Binary minBinary = min.toBinary();
+    Binary maxBinary = max.toBinary();
+    Statistics<?> stats = Statistics.createStats(type);
     stats.updateStats(maxBinary);
     stats.updateStats(minBinary);
     assertThat(stats.genericGetMin()).isEqualTo(minBinary);
@@ -1525,8 +1539,7 @@ public class TestParquetMetadataConverter {
         + "        required binary key (UTF8);" // Key to be hacked to have unknown column order -> undefined
         + "        optional group list_col (LIST) {"
         + "          repeated group list {"
-        + "            optional int96 array_element;" // INT96 element with type defined column order ->
-        // undefined
+        + "            optional int96 array_element;" // plain INT96 element -> INT96_TIMESTAMP_ORDER
         + "          }"
         + "        }"
         + "    }"
@@ -1540,9 +1553,10 @@ public class TestParquetMetadataConverter {
 
     List<org.apache.parquet.format.ColumnOrder> columnOrders = formatMetadata.getColumn_orders();
     assertThat(columnOrders).hasSize(3);
-    for (org.apache.parquet.format.ColumnOrder columnOrder : columnOrders) {
-      assertThat(columnOrder.isSetTYPE_ORDER()).isTrue();
-    }
+    // binary_col and key get TYPE_ORDER, the INT96 array_element gets INT96_TIMESTAMP_ORDER.
+    assertThat(columnOrders.get(0).isSetTYPE_ORDER()).isTrue();
+    assertThat(columnOrders.get(1).isSetTYPE_ORDER()).isTrue();
+    assertThat(columnOrders.get(2).isSetINT96_TIMESTAMP_ORDER()).isTrue();
 
     // Simulate that thrift got a union type that is not in the generated code
     // (when the file contains a not-yet-supported column order)
@@ -1554,7 +1568,42 @@ public class TestParquetMetadataConverter {
     assertThat(columns).hasSize(3);
     assertThat(columns.get(0).getPrimitiveType().columnOrder()).isEqualTo(ColumnOrder.typeDefined());
     assertThat(columns.get(1).getPrimitiveType().columnOrder()).isEqualTo(ColumnOrder.undefined());
-    assertThat(columns.get(2).getPrimitiveType().columnOrder()).isEqualTo(ColumnOrder.undefined());
+    assertThat(columns.get(2).getPrimitiveType().columnOrder()).isEqualTo(ColumnOrder.int96TimestampOrder());
+  }
+
+  @Test
+  public void testUndefinedINT96ColumnOrder() throws IOException {
+    assertInt96ColumnOrderIgnored(null);
+  }
+
+  @Test
+  public void testTypeDefinedOrderINT96ColumnOrder() throws IOException {
+    org.apache.parquet.format.ColumnOrder typeOrder = new org.apache.parquet.format.ColumnOrder();
+    typeOrder.setTYPE_ORDER(new org.apache.parquet.format.TypeDefinedOrder());
+    assertInt96ColumnOrderIgnored(typeOrder);
+  }
+
+  private void assertInt96ColumnOrderIgnored(org.apache.parquet.format.ColumnOrder footerColumnOrder)
+      throws IOException {
+    MessageType schema = parseMessageType("message test {" + "  optional int96 int96_col;" + "}");
+    org.apache.parquet.hadoop.metadata.FileMetaData fileMetaData =
+        new org.apache.parquet.hadoop.metadata.FileMetaData(schema, new HashMap<String, String>(), null);
+    ParquetMetadata metadata = new ParquetMetadata(fileMetaData, new ArrayList<BlockMetaData>());
+    ParquetMetadataConverter converter = new ParquetMetadataConverter();
+    FileMetaData formatMetadata = converter.toParquetMetadata(1, metadata);
+
+    if (footerColumnOrder == null) {
+      formatMetadata.unsetColumn_orders();
+      assertThat(formatMetadata.isSetColumn_orders()).isFalse();
+    } else {
+      formatMetadata.setColumn_orders(Collections.singletonList(footerColumnOrder));
+    }
+
+    MessageType resultSchema =
+        converter.fromParquetMetadata(formatMetadata).getFileMetaData().getSchema();
+    List<ColumnDescriptor> columns = resultSchema.getColumns();
+    assertThat(columns).hasSize(1);
+    assertThat(columns.get(0).getPrimitiveType().columnOrder()).isEqualTo(ColumnOrder.undefined());
   }
 
   @Test
@@ -1627,7 +1676,11 @@ public class TestParquetMetadataConverter {
           .as("Should handle null column index")
           .isNull();
       assertThat(ParquetMetadataConverter.toParquetColumnIndex(
-              Types.required(PrimitiveTypeName.INT96).named("test_int96"), columnIndex))
+              Types.required(PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY)
+                  .length(12)
+                  .as(OriginalType.INTERVAL)
+                  .named("test_interval"),
+              columnIndex))
           .as("Should ignore unsupported types")
           .isNull();
       assertThat(ParquetMetadataConverter.fromParquetColumnIndex(
@@ -2390,6 +2443,125 @@ public class TestParquetMetadataConverter {
     ColumnIndex roundTrip = ParquetMetadataConverter.fromParquetColumnIndex(type, parquetColumnIndex);
     assertThat(roundTrip).isNotNull();
     assertThat(roundTrip.getNanCounts()).containsExactly(1L, 0L, 0L);
+  }
+
+  @Test
+  public void testFileLogicalType() {
+    ParquetMetadataConverter parquetMetadataConverter = new ParquetMetadataConverter();
+
+    MessageType expected = Types.buildMessage()
+        .requiredGroup()
+        .as(LogicalTypeAnnotation.fileType())
+        .optional(PrimitiveTypeName.BINARY)
+        .as(LogicalTypeAnnotation.stringType())
+        .named("uri")
+        .optional(PrimitiveTypeName.INT64)
+        .named("offset")
+        .optional(PrimitiveTypeName.INT64)
+        .named("size")
+        .optional(PrimitiveTypeName.BINARY)
+        .as(LogicalTypeAnnotation.stringType())
+        .named("content_type")
+        .optional(PrimitiveTypeName.BINARY)
+        .as(LogicalTypeAnnotation.stringType())
+        .named("checksum")
+        .optional(PrimitiveTypeName.BINARY)
+        .named("inline")
+        .named("f")
+        .named("example");
+
+    List<SchemaElement> parquetSchema = parquetMetadataConverter.toParquetSchema(expected);
+    MessageType schema = parquetMetadataConverter.fromParquetSchema(parquetSchema, null);
+    assertThat(schema).isEqualTo(expected);
+    LogicalTypeAnnotation logicalType = schema.getType("f").getLogicalTypeAnnotation();
+    assertThat(logicalType).isInstanceOf(LogicalTypeAnnotation.FileLogicalTypeAnnotation.class);
+    assertThat(logicalType).isEqualTo(LogicalTypeAnnotation.fileType());
+  }
+
+  @Test
+  public void testFileLogicalTypeRoundTripUriOnly() {
+    ParquetMetadataConverter parquetMetadataConverter = new ParquetMetadataConverter();
+
+    MessageType expected = Types.buildMessage()
+        .requiredGroup()
+        .as(LogicalTypeAnnotation.fileType())
+        .optional(PrimitiveTypeName.BINARY)
+        .as(LogicalTypeAnnotation.stringType())
+        .named("uri")
+        .named("f")
+        .named("example");
+
+    List<SchemaElement> parquetSchema = parquetMetadataConverter.toParquetSchema(expected);
+    MessageType schema = parquetMetadataConverter.fromParquetSchema(parquetSchema, null);
+    assertThat(schema).isEqualTo(expected);
+    LogicalTypeAnnotation logicalType = schema.getType("f").getLogicalTypeAnnotation();
+    assertThat(logicalType).isInstanceOf(LogicalTypeAnnotation.FileLogicalTypeAnnotation.class);
+  }
+
+  @ParameterizedTest
+  @MethodSource("malformedFileFields")
+  public void testMalformedFileLogicalTypeFailsOnRead(List<org.apache.parquet.schema.Type> fields)
+      throws IOException {
+    ParquetMetadataConverter parquetMetadataConverter = new ParquetMetadataConverter();
+    MessageType physicalSchema = Types.buildMessage()
+        .requiredGroup()
+        .id(17)
+        .addFields(fields.toArray(new org.apache.parquet.schema.Type[0]))
+        .named("f")
+        .required(PrimitiveTypeName.INT32)
+        .named("sibling")
+        .named("example");
+    List<SchemaElement> parquetSchema = parquetMetadataConverter.toParquetSchema(physicalSchema);
+    parquetSchema.get(1).setLogicalType(LogicalType.FILE(new FileType()));
+    FileMetaData footer = new FileMetaData(1, parquetSchema, 0, emptyList());
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    Util.writeFileMetaData(footer, bytes);
+
+    FileMetaData storedFooter = Util.readFileMetaData(new ByteArrayInputStream(bytes.toByteArray()));
+
+    assertThatThrownBy(() -> parquetMetadataConverter.fromParquetMetadata(storedFooter))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageStartingWith("FILE type ");
+  }
+
+  @Test
+  public void testFileLogicalTypeOnPrimitiveIsIgnored() {
+    ParquetMetadataConverter converter = new ParquetMetadataConverter();
+    MessageType physicalSchema = Types.buildMessage()
+        .optional(PrimitiveTypeName.BINARY)
+        .columnOrder(org.apache.parquet.schema.ColumnOrder.undefined())
+        .named("file")
+        .named("example");
+    List<SchemaElement> parquetSchema = converter.toParquetSchema(physicalSchema);
+    parquetSchema.get(1).setLogicalType(LogicalType.FILE(new FileType()));
+
+    assertThat(converter.fromParquetSchema(parquetSchema, null)).isEqualTo(physicalSchema);
+  }
+
+  private static Stream<List<org.apache.parquet.schema.Type>> malformedFileFields() {
+    PrimitiveType uri =
+        Types.optional(PrimitiveTypeName.BINARY).as(stringType()).named("uri");
+    return Stream.of(
+        List.of(Types.optional(PrimitiveTypeName.BINARY).named("uri")),
+        List.of(Types.optional(PrimitiveTypeName.INT32).named("uri")),
+        List.of(Types.required(PrimitiveTypeName.BINARY)
+            .as(stringType())
+            .named("uri")),
+        List.of(Types.optionalGroup()
+            .optional(PrimitiveTypeName.BINARY)
+            .named("nested")
+            .named("uri")),
+        List.of(Types.optional(PrimitiveTypeName.BINARY).named("unknown")),
+        List.of(Types.optional(PrimitiveTypeName.INT64)
+            .as(timestampType(true, MICROS))
+            .named("offset")),
+        List.of(Types.optional(PrimitiveTypeName.INT64)
+            .as(intType(64, false))
+            .named("size")),
+        List.of(Types.optional(PrimitiveTypeName.BINARY)
+            .as(stringType())
+            .named("inline")),
+        List.of(uri, uri));
   }
 
   @Test

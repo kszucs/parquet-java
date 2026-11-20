@@ -87,6 +87,7 @@ import org.apache.parquet.schema.InvalidSchemaException;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
+import org.apache.parquet.util.AutoCloseables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -170,7 +171,7 @@ public class ParquetRewriter implements Closeable {
         "Start rewriting {} input file(s) {} to {}",
         inputFiles.size() + inputFilesToJoin.size(),
         Stream.concat(options.getParquetInputFiles().stream(), options.getParquetInputFilesToJoin().stream())
-            .collect(Collectors.toList()),
+            .toList(),
         out);
 
     if (options.getMaskColumns() != null) {
@@ -273,19 +274,11 @@ public class ParquetRewriter implements Closeable {
   private MessageType getSchemaWithRenamedColumns(MessageType schema) {
     List<Type> fields = schema.getFields().stream()
         .map(type -> {
-          if (!renamedColumns.containsKey(type.getName())) {
+          String newName = renamedColumns.get(type.getName());
+          if (newName == null) {
             return type;
-          } else if (type.isPrimitive()) {
-            return new PrimitiveType(
-                type.getRepetition(),
-                type.asPrimitiveType().getPrimitiveTypeName(),
-                renamedColumns.get(type.getName()));
-          } else {
-            return new GroupType(
-                type.getRepetition(),
-                renamedColumns.get(type.getName()),
-                type.asGroupType().getFields());
           }
+          return type.withName(newName);
         })
         .collect(Collectors.toList());
     return new MessageType(schema.getName(), fields);
@@ -297,7 +290,7 @@ public class ParquetRewriter implements Closeable {
       allFiles = new ArrayList<>(inputFiles);
     } else {
       allFiles = Stream.concat(inputFiles.stream(), inputFilesToJoin.stream())
-          .collect(Collectors.toList());
+          .toList();
     }
     Map<String, String> result = new HashMap<>();
     result.put(
@@ -316,10 +309,10 @@ public class ParquetRewriter implements Closeable {
     if (!inputFilesToJoin.isEmpty()) {
       List<Long> blocksRowCountsL = inputFiles.stream()
           .flatMap(x -> x.getFooter().getBlocks().stream().map(BlockMetaData::getRowCount))
-          .collect(Collectors.toList());
+          .toList();
       List<Long> blocksRowCountsR = inputFilesToJoin.stream()
           .flatMap(x -> x.getFooter().getBlocks().stream().map(BlockMetaData::getRowCount))
-          .collect(Collectors.toList());
+          .toList();
       if (!blocksRowCountsL.equals(blocksRowCountsR)) {
         throw new IllegalArgumentException(
             "The number of rows in each block must match! Left blocks row counts: " + blocksRowCountsL
@@ -336,7 +329,16 @@ public class ParquetRewriter implements Closeable {
             inputFile, ParquetReadOptions.builder(conf).build());
         inputFileReaders.add(reader);
       } catch (IOException e) {
-        throw new IllegalArgumentException("Failed to open input file: " + inputFile, e);
+        IllegalArgumentException failure =
+            new IllegalArgumentException("Failed to open input file: " + inputFile, e);
+        // Close the readers already opened so their input streams do not leak, aggregating any
+        // close failures as suppressed exceptions on the original failure.
+        try {
+          AutoCloseables.close(inputFileReaders);
+        } catch (Throwable t) {
+          failure.addSuppressed(t);
+        }
+        throw failure;
       }
     }
     return inputFileReaders;
@@ -472,14 +474,11 @@ public class ParquetRewriter implements Closeable {
   }
 
   private PrimitiveType normalizeNameInType(PrimitiveType type) {
-    if (renamedColumns.isEmpty()) {
+    String newName = renamedColumns.get(type.getName());
+    if (newName == null) {
       return type;
-    } else {
-      return new PrimitiveType(
-          type.getRepetition(),
-          type.asPrimitiveType().getPrimitiveTypeName(),
-          renamedColumns.getOrDefault(type.getName(), type.getName()));
     }
+    return type.withName(newName);
   }
 
   private void processBlock(
@@ -614,7 +613,7 @@ public class ParquetRewriter implements Closeable {
     }
 
     if (bloomFilter != null) {
-      writer.addBloomFilter(normalizeFieldsInPath(chunk.getPath()).toDotString(), bloomFilter);
+      writer.addBloomFilterForPath(normalizeFieldsInPath(chunk.getPath()), bloomFilter);
     }
 
     reader.setStreamPosition(chunk.getStartingPos());

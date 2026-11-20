@@ -21,26 +21,33 @@ package org.apache.parquet.column;
 import static org.apache.parquet.bytes.BytesUtils.getWidthFromMaxInt;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalDouble;
 import java.util.OptionalLong;
+import java.util.Set;
+import java.util.StringJoiner;
 import org.apache.parquet.Preconditions;
 import org.apache.parquet.bytes.ByteBufferAllocator;
 import org.apache.parquet.bytes.CapacityByteArrayOutputStream;
 import org.apache.parquet.bytes.HeapByteBufferAllocator;
 import org.apache.parquet.column.impl.ColumnWriteStoreV1;
 import org.apache.parquet.column.impl.ColumnWriteStoreV2;
+import org.apache.parquet.column.impl.ContentDefinedChunker;
 import org.apache.parquet.column.page.PageWriteStore;
 import org.apache.parquet.column.values.ValuesWriter;
+import org.apache.parquet.column.values.alp.AlpConfig;
 import org.apache.parquet.column.values.bitpacking.DevNullValuesWriter;
 import org.apache.parquet.column.values.bloomfilter.BloomFilterWriteStore;
 import org.apache.parquet.column.values.factory.DefaultValuesWriterFactory;
 import org.apache.parquet.column.values.factory.ValuesWriterFactory;
 import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridEncoder;
 import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesWriter;
+import org.apache.parquet.hadoop.metadata.ColumnPath;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 
 /**
  * This class represents all the configurable Parquet properties.
@@ -67,6 +74,9 @@ public class ParquetProperties {
   public static final int DEFAULT_BLOOM_FILTER_CANDIDATES_NUMBER = 5;
   public static final boolean DEFAULT_STATISTICS_ENABLED = true;
   public static final boolean DEFAULT_SIZE_STATISTICS_ENABLED = true;
+  public static final long DEFAULT_CONTENT_DEFINED_CHUNKING_MIN_SIZE = 256 * 1024;
+  public static final long DEFAULT_CONTENT_DEFINED_CHUNKING_MAX_SIZE = 1024 * 1024;
+  public static final int DEFAULT_CONTENT_DEFINED_CHUNKING_NORM_LEVEL = 0;
 
   public static final boolean DEFAULT_PAGE_WRITE_CHECKSUM_ENABLED = true;
 
@@ -133,11 +143,16 @@ public class ParquetProperties {
   private final int pageRowCountLimit;
   private final boolean pageWriteChecksumEnabled;
   private final ColumnProperty<ByteStreamSplitMode> byteStreamSplitEnabled;
+  private final ColumnProperty<AlpConfig> alp;
   private final Map<String, String> extraMetaData;
   private final ColumnProperty<Boolean> statistics;
   private final ColumnProperty<Boolean> sizeStatistics;
   private final ColumnProperty<CompressionCodecName> columnCodecs;
   private final ColumnProperty<Integer> columnCompressionLevels;
+  private final boolean contentDefinedChunkingEnabled;
+  private final long contentDefinedChunkingMinSize;
+  private final long contentDefinedChunkingMaxSize;
+  private final int contentDefinedChunkingNormLevel;
 
   private ParquetProperties(Builder builder) {
     this.pageSizeThreshold = builder.pageSize;
@@ -167,11 +182,21 @@ public class ParquetProperties {
     this.pageRowCountLimit = builder.pageRowCountLimit;
     this.pageWriteChecksumEnabled = builder.pageWriteChecksumEnabled;
     this.byteStreamSplitEnabled = builder.byteStreamSplitEnabled.build();
+    this.alp = builder.alp.build();
     this.extraMetaData = builder.extraMetaData;
     this.statistics = builder.statistics.build();
     this.sizeStatistics = builder.sizeStatistics.build();
     this.columnCodecs = builder.columnCodecs.build();
     this.columnCompressionLevels = builder.columnCompressionLevels.build();
+    this.contentDefinedChunkingEnabled = builder.contentDefinedChunkingEnabled;
+    this.contentDefinedChunkingMinSize = builder.contentDefinedChunkingMinSize;
+    this.contentDefinedChunkingMaxSize = builder.contentDefinedChunkingMaxSize;
+    this.contentDefinedChunkingNormLevel = builder.contentDefinedChunkingNormLevel;
+    if (contentDefinedChunkingEnabled) {
+      // Rejected here rather than once a writer has opened its file
+      ContentDefinedChunker.calculateMask(
+          contentDefinedChunkingMinSize, contentDefinedChunkingMaxSize, contentDefinedChunkingNormLevel);
+    }
   }
 
   public static Builder builder() {
@@ -251,44 +276,136 @@ public class ParquetProperties {
   }
 
   public boolean isByteStreamSplitEnabled(ColumnDescriptor column) {
+    return switch (column.getPrimitiveType().getPrimitiveTypeName()) {
+      case FLOAT, DOUBLE -> byteStreamSplitEnabled.getValue(column) != ByteStreamSplitMode.NONE;
+      case INT32, INT64, FIXED_LEN_BYTE_ARRAY ->
+        byteStreamSplitEnabled.getValue(column) == ByteStreamSplitMode.EXTENDED;
+      default -> false;
+    };
+  }
+
+  /**
+   * Get the ALP configuration for the given column. ALP encoding is only supported for FLOAT and
+   * DOUBLE types, so any other type is never ALP encoded.
+   *
+   * @param column the column descriptor
+   * @return the ALP configuration for this column, or null if the column is not ALP encoded
+   */
+  public AlpConfig getAlpConfig(ColumnDescriptor column) {
     switch (column.getPrimitiveType().getPrimitiveTypeName()) {
       case FLOAT:
       case DOUBLE:
-        return byteStreamSplitEnabled.getValue(column) != ByteStreamSplitMode.NONE;
-      case INT32:
-      case INT64:
-      case FIXED_LEN_BYTE_ARRAY:
-        return byteStreamSplitEnabled.getValue(column) == ByteStreamSplitMode.EXTENDED;
+        return alp.getValue(column);
       default:
-        return false;
+        return null;
     }
+  }
+
+  /**
+   * Check if ALP encoding is enabled for the given column.
+   *
+   * @param column the column descriptor
+   * @return true if ALP encoding is enabled for this column
+   */
+  public boolean isAlpEnabled(ColumnDescriptor column) {
+    return getAlpConfig(column) != null;
   }
 
   public ByteBufferAllocator getAllocator() {
     return allocator;
   }
 
-  public ColumnWriteStore newColumnWriteStore(MessageType schema, PageWriteStore pageStore) {
-    switch (writerVersion) {
-      case PARQUET_1_0:
-        return new ColumnWriteStoreV1(schema, pageStore, this);
-      case PARQUET_2_0:
-        return new ColumnWriteStoreV2(schema, pageStore, this);
-      default:
-        throw new IllegalArgumentException("unknown version " + writerVersion);
+  /**
+   * Checks the ALP configuration against the schema it will be used with. ALP only applies to FLOAT
+   * and DOUBLE columns, and a column cannot be both ALP and BYTE_STREAM_SPLIT encoded, so rather
+   * than silently picking one, both cases are rejected before anything is written.
+   *
+   * @param schema the schema being written
+   * @throws IllegalArgumentException if a column is misconfigured
+   */
+  private void validateAlp(MessageType schema) {
+    Set<ColumnPath> alpColumns = alp.getColumnPaths();
+    if (alp.getDefaultValue() == null && alpColumns.isEmpty()) {
+      return;
     }
+
+    for (ColumnDescriptor column : schema.getColumns()) {
+      ColumnPath path = ColumnPath.get(column.getPath());
+      PrimitiveTypeName type = column.getPrimitiveType().getPrimitiveTypeName();
+
+      boolean enabledExplicitly = alpColumns.contains(path) && alp.getValue(path) != null;
+      if (enabledExplicitly && type != PrimitiveTypeName.FLOAT && type != PrimitiveTypeName.DOUBLE) {
+        throw new IllegalArgumentException("ALP encoding is enabled for column " + path.toDotString()
+            + " of type " + type + ", but ALP only supports FLOAT and DOUBLE columns");
+      }
+
+      if (isAlpEnabled(column) && isByteStreamSplitEnabled(column)) {
+        throw new IllegalArgumentException(
+            "Column " + path.toDotString()
+                + " has both ALP and BYTE_STREAM_SPLIT encoding enabled, but a column can only use one of them");
+      }
+    }
+  }
+
+  /** Renders the ALP property, showing "off" rather than "null" wherever ALP is not configured. */
+  private String alpToString() {
+    AlpConfig defaultConfig = alp.getDefaultValue();
+    String rendered = defaultConfig == null ? "off" : defaultConfig.toString();
+
+    Set<ColumnPath> columns = alp.getColumnPaths();
+    if (columns.isEmpty()) {
+      return rendered;
+    }
+
+    StringJoiner perColumn = new StringJoiner(", ", " {", "}");
+    for (ColumnPath column : columns) {
+      AlpConfig columnConfig = alp.getValue(column);
+      perColumn.add(column.toDotString() + "=" + (columnConfig == null ? "off" : columnConfig));
+    }
+    return rendered + perColumn;
+  }
+
+  public ColumnWriteStore newColumnWriteStore(MessageType schema, PageWriteStore pageStore) {
+    validateAlp(schema);
+    return switch (writerVersion) {
+      case PARQUET_1_0 -> new ColumnWriteStoreV1(schema, pageStore, this);
+      case PARQUET_2_0 -> new ColumnWriteStoreV2(schema, pageStore, this);
+      default -> throw new IllegalArgumentException("unknown version " + writerVersion);
+    };
   }
 
   public ColumnWriteStore newColumnWriteStore(
       MessageType schema, PageWriteStore pageStore, BloomFilterWriteStore bloomFilterWriteStore) {
-    switch (writerVersion) {
-      case PARQUET_1_0:
-        return new ColumnWriteStoreV1(schema, pageStore, bloomFilterWriteStore, this);
-      case PARQUET_2_0:
-        return new ColumnWriteStoreV2(schema, pageStore, bloomFilterWriteStore, this);
-      default:
-        throw new IllegalArgumentException("unknown version " + writerVersion);
-    }
+    validateAlp(schema);
+    return switch (writerVersion) {
+      case PARQUET_1_0 -> new ColumnWriteStoreV1(schema, pageStore, bloomFilterWriteStore, this);
+      case PARQUET_2_0 -> new ColumnWriteStoreV2(schema, pageStore, bloomFilterWriteStore, this);
+      default -> throw new IllegalArgumentException("unknown version " + writerVersion);
+    };
+  }
+
+  /**
+   * EXPERIMENTAL: The column write store of a row group, continuing the chunking of the file's earlier
+   * row groups. Required with content defined chunking.
+   *
+   * @param schema the schema of the row group
+   * @param pageStore the page store of the row group
+   * @param bloomFilterWriteStore the bloom filter store of the row group
+   * @param chunkers the file's {@link ContentDefinedChunker#forColumns chunkers}, or {@code null}
+   *     without content defined chunking
+   * @return the column write store
+   */
+  public ColumnWriteStore newColumnWriteStore(
+      MessageType schema,
+      PageWriteStore pageStore,
+      BloomFilterWriteStore bloomFilterWriteStore,
+      List<ContentDefinedChunker> chunkers) {
+    validateAlp(schema);
+    return switch (writerVersion) {
+      case PARQUET_1_0 -> new ColumnWriteStoreV1(schema, pageStore, bloomFilterWriteStore, this, chunkers);
+      case PARQUET_2_0 -> new ColumnWriteStoreV2(schema, pageStore, bloomFilterWriteStore, this, chunkers);
+      default -> throw new IllegalArgumentException("unknown version " + writerVersion);
+    };
   }
 
   public int getMinRowCountForPageSizeCheck() {
@@ -317,6 +434,42 @@ public class ParquetProperties {
 
   public int getRowGroupRowCountLimit() {
     return rowGroupRowCountLimit;
+  }
+
+  /**
+   * EXPERIMENTAL
+   *
+   * @return {@code true} if content defined chunking is enabled
+   */
+  public boolean isContentDefinedChunkingEnabled() {
+    return contentDefinedChunkingEnabled;
+  }
+
+  /**
+   * EXPERIMENTAL
+   *
+   * @return the minimum content defined chunk size in bytes
+   */
+  public long getContentDefinedChunkingMinSize() {
+    return contentDefinedChunkingMinSize;
+  }
+
+  /**
+   * EXPERIMENTAL
+   *
+   * @return the maximum content defined chunk size in bytes
+   */
+  public long getContentDefinedChunkingMaxSize() {
+    return contentDefinedChunkingMaxSize;
+  }
+
+  /**
+   * EXPERIMENTAL
+   *
+   * @return the normalization level of the content defined chunking's rolling hash mask
+   */
+  public int getContentDefinedChunkingNormLevel() {
+    return contentDefinedChunkingNormLevel;
   }
 
   public int getPageRowCountLimit() {
@@ -413,9 +566,16 @@ public class ParquetProperties {
         + "Bloom filter expected number of distinct values are: " + bloomFilterNDVs + '\n'
         + "Bloom filter false positive probabilities are: " + bloomFilterFPPs + '\n'
         + "Page row count limit to " + getPageRowCountLimit() + '\n'
+        + "Content defined chunking is: "
+        + (contentDefinedChunkingEnabled
+            ? contentDefinedChunkingMinSize + " to " + contentDefinedChunkingMaxSize
+                + " bytes, normalization level " + contentDefinedChunkingNormLevel
+            : "off")
+        + '\n'
         + "Writing page checksums is: " + (getPageWriteChecksumEnabled() ? "on" : "off") + '\n'
         + "Statistics enabled: " + statisticsEnabled + '\n'
-        + "Size statistics enabled: " + sizeStatisticsEnabled;
+        + "Size statistics enabled: " + sizeStatisticsEnabled + '\n'
+        + "ALP: " + alpToString();
     String perColumn = "";
     if (!columnCodecs.toString().equals(Objects.toString(columnCodecs.getDefaultValue()))) {
       perColumn = "Per-column codecs: " + columnCodecs;
@@ -455,11 +615,16 @@ public class ParquetProperties {
     private int pageRowCountLimit = DEFAULT_PAGE_ROW_COUNT_LIMIT;
     private boolean pageWriteChecksumEnabled = DEFAULT_PAGE_WRITE_CHECKSUM_ENABLED;
     private final ColumnProperty.Builder<ByteStreamSplitMode> byteStreamSplitEnabled;
+    private final ColumnProperty.Builder<AlpConfig> alp;
     private Map<String, String> extraMetaData = new HashMap<>();
     private final ColumnProperty.Builder<Boolean> statistics;
     private final ColumnProperty.Builder<Boolean> sizeStatistics;
     private final ColumnProperty.Builder<CompressionCodecName> columnCodecs;
     private final ColumnProperty.Builder<Integer> columnCompressionLevels;
+    private boolean contentDefinedChunkingEnabled;
+    private long contentDefinedChunkingMinSize = DEFAULT_CONTENT_DEFINED_CHUNKING_MIN_SIZE;
+    private long contentDefinedChunkingMaxSize = DEFAULT_CONTENT_DEFINED_CHUNKING_MAX_SIZE;
+    private int contentDefinedChunkingNormLevel = DEFAULT_CONTENT_DEFINED_CHUNKING_NORM_LEVEL;
 
     private Builder() {
       enableDict = ColumnProperty.<Boolean>builder().withDefaultValue(DEFAULT_IS_DICTIONARY_ENABLED);
@@ -468,6 +633,7 @@ public class ParquetProperties {
               DEFAULT_IS_BYTE_STREAM_SPLIT_ENABLED
                   ? ByteStreamSplitMode.FLOATING_POINT
                   : ByteStreamSplitMode.NONE);
+      alp = ColumnProperty.<AlpConfig>builder().withDefaultValue(null);
       bloomFilterEnabled = ColumnProperty.<Boolean>builder().withDefaultValue(DEFAULT_BLOOM_FILTER_ENABLED);
       bloomFilterNDVs = ColumnProperty.<Long>builder().withDefaultValue(null);
       bloomFilterFPPs = ColumnProperty.<Double>builder().withDefaultValue(DEFAULT_BLOOM_FILTER_FPP);
@@ -504,6 +670,7 @@ public class ParquetProperties {
       this.numBloomFilterCandidates = ColumnProperty.builder(toCopy.numBloomFilterCandidates);
       this.maxBloomFilterBytes = toCopy.maxBloomFilterBytes;
       this.byteStreamSplitEnabled = ColumnProperty.builder(toCopy.byteStreamSplitEnabled);
+      this.alp = ColumnProperty.builder(toCopy.alp);
       this.extraMetaData = toCopy.extraMetaData;
       this.statistics = ColumnProperty.builder(toCopy.statistics);
       this.statisticsEnabled = toCopy.statisticsEnabled;
@@ -511,6 +678,10 @@ public class ParquetProperties {
       this.sizeStatisticsEnabled = toCopy.sizeStatisticsEnabled;
       this.columnCodecs = ColumnProperty.builder(toCopy.columnCodecs);
       this.columnCompressionLevels = ColumnProperty.builder(toCopy.columnCompressionLevels);
+      this.contentDefinedChunkingEnabled = toCopy.contentDefinedChunkingEnabled;
+      this.contentDefinedChunkingMinSize = toCopy.contentDefinedChunkingMinSize;
+      this.contentDefinedChunkingMaxSize = toCopy.contentDefinedChunkingMaxSize;
+      this.contentDefinedChunkingNormLevel = toCopy.contentDefinedChunkingNormLevel;
     }
 
     /**
@@ -582,6 +753,71 @@ public class ParquetProperties {
     public Builder withExtendedByteStreamSplitEncoding(boolean enable) {
       this.byteStreamSplitEnabled.withDefaultValue(
           enable ? ByteStreamSplitMode.EXTENDED : ByteStreamSplitMode.NONE);
+      return this;
+    }
+
+    /**
+     * Enable ALP encoding for FLOAT and DOUBLE columns, using the default configuration.
+     *
+     * @return this builder for method chaining.
+     */
+    public Builder withAlp() {
+      return withAlp(AlpConfig.DEFAULT);
+    }
+
+    /**
+     * Enable ALP encoding for FLOAT and DOUBLE columns with the given configuration.
+     *
+     * @param config the ALP configuration
+     * @return this builder for method chaining.
+     */
+    public Builder withAlp(AlpConfig config) {
+      this.alp.withDefaultValue(Objects.requireNonNull(config, "ALP config cannot be null"));
+      return this;
+    }
+
+    /**
+     * Enable ALP encoding for the specified column, using the default configuration.
+     *
+     * @param columnPath the path of the column (dot-string)
+     * @return this builder for method chaining.
+     */
+    public Builder withAlp(String columnPath) {
+      return withAlp(columnPath, AlpConfig.DEFAULT);
+    }
+
+    /**
+     * Enable ALP encoding for the specified column with the given configuration.
+     *
+     * @param columnPath the path of the column (dot-string)
+     * @param config     the ALP configuration
+     * @return this builder for method chaining.
+     */
+    public Builder withAlp(String columnPath, AlpConfig config) {
+      this.alp.withValue(columnPath, Objects.requireNonNull(config, "ALP config cannot be null"));
+      return this;
+    }
+
+    /**
+     * Disable ALP encoding for the specified column, overriding any default set by
+     * {@link #withAlp()}.
+     *
+     * @param columnPath the path of the column (dot-string)
+     * @return this builder for method chaining.
+     */
+    public Builder withoutAlp(String columnPath) {
+      this.alp.withValue(columnPath, null);
+      return this;
+    }
+
+    /**
+     * Disable ALP encoding by default. Columns enabled individually by
+     * {@link #withAlp(String)} keep it.
+     *
+     * @return this builder for method chaining.
+     */
+    public Builder withoutAlp() {
+      this.alp.withDefaultValue(null);
       return this;
     }
 
@@ -752,6 +988,61 @@ public class ParquetProperties {
     public Builder withPageRowCountLimit(int rowCount) {
       Preconditions.checkArgument(rowCount > 0, "Invalid row count limit for pages: %s", rowCount);
       pageRowCountLimit = rowCount;
+      return this;
+    }
+
+    /**
+     * EXPERIMENTAL: Enable or disable content defined chunking, which also ends data pages where a
+     * rolling hash of the values matches, as Arrow C++ and arrow-rs do, so that files sharing a run of
+     * values share pages. Disabled by default. The page size and row count limits still apply. Column
+     * write stores must then come from
+     * {@link ParquetProperties#newColumnWriteStore(MessageType, PageWriteStore, BloomFilterWriteStore,
+     * List)}, and {@link #build()} rejects an invalid chunk size range.
+     *
+     * <p>With dictionary encoding, an edit that adds values renumbers the indices of values first seen
+     * after it. As parquet-java chooses between dictionary and plain encoding on the first page of a
+     * column chunk, which chunking can cut short, some column chunks fall back to plain encoding.
+     *
+     * @param enabled whether to enable content defined chunking
+     * @return this builder for method chaining.
+     */
+    public Builder withContentDefinedChunking(boolean enabled) {
+      this.contentDefinedChunkingEnabled = enabled;
+      return this;
+    }
+
+    /**
+     * EXPERIMENTAL: Set the minimum content defined chunk size, 256 KiB by default. Sizes count values
+     * and levels before encoding, at the width Arrow holds them in: an INT(16) value counts 2 bytes.
+     *
+     * @param minSize the minimum chunk size in bytes
+     * @return this builder for method chaining.
+     */
+    public Builder withContentDefinedChunkingMinSize(long minSize) {
+      this.contentDefinedChunkingMinSize = minSize;
+      return this;
+    }
+
+    /**
+     * EXPERIMENTAL: Set the maximum content defined chunk size, 1 MiB by default.
+     *
+     * @param maxSize the maximum chunk size in bytes
+     * @return this builder for method chaining.
+     */
+    public Builder withContentDefinedChunkingMaxSize(long maxSize) {
+      this.contentDefinedChunkingMaxSize = maxSize;
+      return this;
+    }
+
+    /**
+     * EXPERIMENTAL: Set the normalization level of the content defined chunking's rolling hash mask, 0
+     * by default. Raising it makes chunk sizes more uniform at the cost of more small pages.
+     *
+     * @param normLevel the normalization level
+     * @return this builder for method chaining.
+     */
+    public Builder withContentDefinedChunkingNormLevel(int normLevel) {
+      this.contentDefinedChunkingNormLevel = normLevel;
       return this;
     }
 
